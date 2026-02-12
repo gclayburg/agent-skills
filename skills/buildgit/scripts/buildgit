@@ -1,0 +1,1035 @@
+#!/usr/bin/env bash
+#
+# buildgit - Combined Git and Jenkins Build Tool
+#
+# A unified interface for git operations tied to Jenkins CI/CD pipelines.
+# Combines functionality from git, checkbuild.sh, and pushmon.sh.
+#
+# Usage:
+#   buildgit [global-options] <command> [command-options] [arguments]
+#
+# Global Options:
+#   -j, --job <name>    Specify Jenkins job name
+#   -h, --help          Show help
+#   --verbose           Enable verbose/debug output
+#
+# Commands:
+#   status              Jenkins build status
+#   push                Push commits + monitor Jenkins build
+#   build               Trigger + monitor Jenkins build
+#   <any-git-command>   Passed through to git
+#
+
+set -euo pipefail
+
+# =============================================================================
+# Script Setup
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/jenkins-common.sh"
+
+# =============================================================================
+# Global Variables
+# =============================================================================
+
+JOB_NAME=""
+VERBOSE_MODE=false
+CONSOLE_MODE=""
+COMMAND=""
+COMMAND_ARGS=()
+
+# Follow mode configuration (matches pushmon.sh)
+POLL_INTERVAL="${POLL_INTERVAL:-5}"
+MAX_BUILD_TIME="${MAX_BUILD_TIME:-1800}"
+
+# =============================================================================
+# Interrupt Handler for Follow Mode
+# =============================================================================
+# Spec reference: buildgit-spec.md, buildgit status -f/--follow
+# "Exit with Ctrl+C"
+
+_follow_mode_cleanup() {
+    local exit_code=$?
+    echo ""
+    bg_log_warning "Monitoring stopped by user"
+    if [[ -n "${_FOLLOW_JOB_NAME:-}" ]]; then
+        bg_log_essential "Resume monitoring with: buildgit status -f -j ${_FOLLOW_JOB_NAME}"
+    fi
+    exit 130
+}
+
+_FOLLOW_JOB_NAME=""
+
+# =============================================================================
+# Usage
+# =============================================================================
+
+show_usage() {
+    cat <<EOF
+Usage: buildgit [global-options] <command> [command-options] [arguments]
+
+A unified interface for git operations with Jenkins CI/CD integration.
+
+Global Options:
+  -j, --job <name>               Specify Jenkins job name (overrides auto-detection)
+  -c, --console <mode>           Show console log output (auto or line count)
+  -h, --help                     Show this help message
+  --verbose                      Enable verbose output for debugging
+
+Commands:
+  status [-f|--follow] [--json]
+                      Display Jenkins build status
+  push [--no-follow] [git-push-options] [remote] [branch]
+                      Push commits and monitor Jenkins build
+  build [--no-follow] Trigger and monitor Jenkins build
+  <any-git-command>   Passed through to git
+
+Examples:
+  buildgit status              # Jenkins build status snapshot
+  buildgit status -f           # Follow builds indefinitely
+  buildgit status --json       # JSON format for Jenkins status
+  buildgit push                # Push + monitor build
+  buildgit push --no-follow    # Push only, no monitoring
+  buildgit --job myjob build   # Trigger build for specific job
+  buildgit log --oneline -5    # Passed through to git
+
+Environment Variables:
+  JENKINS_URL         Base URL of the Jenkins server
+  JENKINS_USER_ID     Jenkins username for API authentication
+  JENKINS_API_TOKEN   Jenkins API token for authentication
+EOF
+}
+
+# =============================================================================
+# Argument Parsing
+# =============================================================================
+
+# Parse global options (before the command)
+# Global options: -j/--job, -h/--help, --verbose
+# Stops at first non-option argument (the command)
+parse_global_options() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -j|--job)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option $1 requires a job name"
+                    exit 1
+                fi
+                JOB_NAME="$2"
+                shift 2
+                ;;
+            -c|--console)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Option $1 requires a mode (auto or line count)"
+                    exit 1
+                fi
+                if [[ "$2" != "auto" ]] && ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    log_error "Invalid console mode: $2 (must be 'auto' or a number)"
+                    exit 1
+                fi
+                CONSOLE_MODE="$2"
+                shift 2
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            --verbose)
+                VERBOSE_MODE=true
+                shift
+                ;;
+            -*)
+                # Unknown option before command - error
+                log_error "Unknown global option: $1"
+                echo ""
+                show_usage
+                exit 1
+                ;;
+            *)
+                # First non-option is the command
+                COMMAND="$1"
+                shift
+                # Remaining arguments are command arguments
+                COMMAND_ARGS=("$@")
+                return 0
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# Command Stubs (to be implemented in later chunks)
+# =============================================================================
+
+# =============================================================================
+# Status Command Implementation
+# =============================================================================
+
+# Parse status command options
+# Sets: STATUS_JSON_MODE, STATUS_FOLLOW_MODE
+_parse_status_options() {
+    STATUS_JSON_MODE=false
+    STATUS_FOLLOW_MODE=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)
+                STATUS_JSON_MODE=true
+                shift
+                ;;
+            -f|--follow)
+                STATUS_FOLLOW_MODE=true
+                shift
+                ;;
+            *)
+                bg_log_error "Unknown option for status command: $1"
+                return 1
+                ;;
+        esac
+    done
+}
+
+# Extract trigger, commit, and correlation info from a build
+# Usage: _extract_build_context "job-name" "build-number" "console_output"
+# Sets globals: _BC_TRIGGER_TYPE, _BC_TRIGGER_USER,
+#               _BC_COMMIT_SHA, _BC_COMMIT_MSG, _BC_CORRELATION_STATUS
+_extract_build_context() {
+    local job_name="$1"
+    local build_number="$2"
+    local console_output="$3"
+
+    # Detect trigger type
+    if [[ -n "$console_output" ]]; then
+        local trigger_info
+        trigger_info=$(detect_trigger_type "$console_output")
+        _BC_TRIGGER_TYPE=$(echo "$trigger_info" | head -1)
+        _BC_TRIGGER_USER=$(echo "$trigger_info" | tail -1)
+    else
+        _BC_TRIGGER_TYPE="unknown"
+        _BC_TRIGGER_USER="unknown"
+    fi
+
+    # Extract triggering commit
+    local commit_info
+    commit_info=$(extract_triggering_commit "$job_name" "$build_number" "$console_output")
+    _BC_COMMIT_SHA=$(echo "$commit_info" | head -1)
+    _BC_COMMIT_MSG=$(echo "$commit_info" | tail -1)
+
+    # Correlate commit with local history
+    _BC_CORRELATION_STATUS=$(correlate_commit "$_BC_COMMIT_SHA")
+}
+
+# Perform Jenkins status check and display
+# Reuses logic from checkbuild.sh
+# Arguments: job_name, json_mode
+# Returns: exit code (0=success, 1=failure, 2=building)
+_jenkins_status_check() {
+    local job_name="$1"
+    local json_mode="$2"
+
+    # Get last build number
+    bg_log_info "Fetching last build information..."
+    local build_number
+    build_number=$(get_last_build_number "$job_name")
+
+    if [[ "$build_number" == "0" || -z "$build_number" ]]; then
+        bg_log_error "No builds found for job '$job_name'"
+        return 1
+    fi
+
+    # Get build info
+    local build_json
+    build_json=$(get_build_info "$job_name" "$build_number")
+
+    if [[ -z "$build_json" ]]; then
+        bg_log_error "Failed to fetch build information"
+        return 1
+    fi
+
+    # Extract build status
+    local result building
+    result=$(echo "$build_json" | jq -r '.result // "null"')
+    building=$(echo "$build_json" | jq -r '.building // false')
+
+    bg_log_success "Build #$build_number found"
+
+    # Get console output for trigger detection and commit extraction
+    bg_log_info "Analyzing build details..."
+    local console_output
+    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
+
+    # Extract trigger, commit, and correlation context
+    _extract_build_context "$job_name" "$build_number" "$console_output"
+
+    # Determine output based on build status
+    local exit_code
+
+    if [[ "$building" == "true" ]]; then
+        # Build is in progress
+        local current_stage
+        current_stage=$(get_current_stage "$job_name" "$build_number" 2>/dev/null) || true
+
+        if [[ "$json_mode" == "true" ]]; then
+            output_json "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS" "$console_output"
+        else
+            display_building_output "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS" "$current_stage"
+        fi
+        exit_code=2
+
+    elif [[ "$result" == "SUCCESS" ]]; then
+        # Build succeeded
+        if [[ "$json_mode" == "true" ]]; then
+            output_json "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS" "$console_output"
+        else
+            display_success_output "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS"
+        fi
+        exit_code=0
+
+    else
+        # Build failed (FAILURE, UNSTABLE, ABORTED, or other)
+        if [[ "$json_mode" == "true" ]]; then
+            output_json "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS" "$console_output"
+        else
+            display_failure_output "$job_name" "$build_number" "$build_json" \
+                "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+                "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+                "$_BC_CORRELATION_STATUS" "$console_output"
+        fi
+        exit_code=1
+    fi
+
+    return "$exit_code"
+}
+
+# Monitor a build until completion
+# Reuses monitoring logic from pushmon.sh pattern
+# Arguments: job_name, build_number
+# Returns: 0 when build completes
+# Unified build monitoring loop
+# Polls Jenkins API until build completes, tracking stage changes in real-time
+# Arguments: job_name, build_number
+# Returns: 0 when build completes, 1 on timeout/error
+# Spec: unify-follow-log-spec.md, Section 3 (Stage Output)
+_monitor_build() {
+    local job_name="$1"
+    local build_number="$2"
+    local elapsed=0
+    local consecutive_failures=0
+    local last_time_report=0
+
+    # Initialize stage_state from banner's snapshot (avoids timing gaps)
+    # _BANNER_STAGES_JSON is set by _display_stages() --completed-only in the banner
+    # Spec: bug-show-all-stages.md - use banner state to avoid missing stages
+    local stage_state="${_BANNER_STAGES_JSON:-[]}"
+    _BANNER_STAGES_JSON=""  # Reset after reading
+
+    bg_log_info "Monitoring build #${build_number}..."
+
+    while [[ $elapsed -lt $MAX_BUILD_TIME ]]; do
+        local build_info
+        build_info=$(get_build_info "$job_name" "$build_number")
+
+        if [[ -z "$build_info" ]]; then
+            consecutive_failures=$((consecutive_failures + 1))
+            if [[ $consecutive_failures -ge 5 ]]; then
+                bg_log_error "Too many consecutive API failures ($consecutive_failures)"
+                return 1
+            fi
+            bg_log_warning "API request failed, retrying... ($consecutive_failures/5)"
+            sleep "$POLL_INTERVAL"
+            elapsed=$((elapsed + POLL_INTERVAL))
+            continue
+        fi
+
+        consecutive_failures=0
+
+        # Track stage changes BEFORE checking completion
+        # This ensures the final iteration still catches stage transitions
+        # Spec: bug-show-all-stages.md - all stages must be shown
+        stage_state=$(track_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE")
+
+        local building result
+        building=$(echo "$build_info" | jq -r '.building')
+        result=$(echo "$build_info" | jq -r '.result // empty')
+
+        # Check completion (after stage tracking so final transitions are caught)
+        if [[ "$building" == "false" && -n "$result" ]]; then
+            return 0
+        fi
+
+        # Verbose-only elapsed time messages
+        # Spec: full-stage-print-spec.md, Verbose mode
+        if [[ "$VERBOSE_MODE" == "true" && $((elapsed - last_time_report)) -ge 30 ]]; then
+            bg_log_progress "Build in progress... (${elapsed}s elapsed)"
+            last_time_report=$elapsed
+        fi
+
+        sleep "$POLL_INTERVAL"
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    bg_log_error "Build timeout: exceeded ${MAX_BUILD_TIME} seconds"
+    bg_log_info "Build may still be running - check Jenkins console" >&2
+    return 1
+}
+
+# Display build in progress banner (unified header format)
+# Used before monitoring begins for all commands (push, build, status -f)
+# Arguments: job_name, build_number, [elapsed_suffix]
+# Spec reference: unify-follow-log-spec.md, Section 2 (Build Header)
+_display_build_in_progress_banner() {
+    local job_name="$1"
+    local build_number="$2"
+    local elapsed_suffix="${3:-}"
+
+    # Get build info
+    local build_json
+    build_json=$(get_build_info "$job_name" "$build_number")
+
+    if [[ -z "$build_json" ]]; then
+        bg_log_warning "Could not fetch build info for banner display"
+        return 0
+    fi
+
+    # Get console output for trigger detection, commit extraction, and Build Info section
+    local console_output
+    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
+
+    # Extract trigger, commit, and correlation context
+    _extract_build_context "$job_name" "$build_number" "$console_output"
+
+    # Get current stage
+    local current_stage
+    current_stage=$(get_current_stage "$job_name" "$build_number" 2>/dev/null) || true
+
+    # Display the unified header (banner + metadata + Build Info + Console URL)
+    # Spec: unify-follow-log-spec.md, Section 2
+    display_building_output "$job_name" "$build_number" "$build_json" \
+        "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+        "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+        "$_BC_CORRELATION_STATUS" "$current_stage" \
+        "$console_output" "$elapsed_suffix"
+
+    # Display only completed stages after the header (skip IN_PROGRESS)
+    # Also saves full stage state to _BANNER_STAGES_JSON for _monitor_build
+    # Spec: bug-show-all-stages.md - never show "(running)" in initial display
+    echo ""
+    _display_stages "$job_name" "$build_number" --completed-only
+}
+
+# Wait for a new build to start (for follow mode)
+# Arguments: job_name, baseline_build_number
+# Returns: new build number on stdout, or exits on timeout
+_follow_wait_for_new_build() {
+    local job_name="$1"
+    local baseline="$2"
+
+    while true; do
+        local current
+        current=$(get_last_build_number "$job_name")
+
+        if [[ "$current" -gt "$baseline" ]]; then
+            echo "$current"
+            return 0
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# Display completed build with full header (for follow mode)
+# Used when the follow loop detects a build that already completed
+# Reuses the same display functions as snapshot `buildgit status`
+# Arguments: job_name, build_number, build_json
+# Returns: 0 for SUCCESS, 1 for FAILURE/UNSTABLE/other
+# Spec: bug-status-f-missing-header-spec.md
+_display_completed_build() {
+    local job_name="$1"
+    local build_number="$2"
+    local build_json="$3"
+
+    local result
+    result=$(echo "$build_json" | jq -r '.result // "UNKNOWN"')
+
+    # Get console output for trigger detection, commit extraction, and Build Info
+    local console_output
+    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
+
+    # Extract trigger, commit, and correlation context
+    _extract_build_context "$job_name" "$build_number" "$console_output"
+
+    # Display using the same output path as snapshot mode
+    if [[ "$result" == "SUCCESS" ]]; then
+        display_success_output "$job_name" "$build_number" "$build_json" \
+            "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+            "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+            "$_BC_CORRELATION_STATUS"
+    else
+        display_failure_output "$job_name" "$build_number" "$build_json" \
+            "$_BC_TRIGGER_TYPE" "$_BC_TRIGGER_USER" \
+            "$_BC_COMMIT_SHA" "$_BC_COMMIT_MSG" \
+            "$_BC_CORRELATION_STATUS" "$console_output"
+    fi
+
+    # Print final status line (not included in display_*_output functions)
+    echo ""
+    print_finished_line "$result"
+
+    # Return appropriate exit code
+    if [[ "$result" == "SUCCESS" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Follow mode implementation for status command
+# Spec reference: buildgit-spec.md, buildgit status -f/--follow
+# "Monitor current build if in progress, then wait indefinitely for subsequent builds"
+_cmd_status_follow() {
+    local job_name="$1"
+    local json_mode="$2"
+
+    # Store job name for cleanup handler
+    _FOLLOW_JOB_NAME="$job_name"
+
+    # Set up interrupt handler for follow mode
+    trap _follow_mode_cleanup SIGINT SIGTERM
+
+    bg_log_info "Follow mode enabled - monitoring builds for job '$job_name'"
+    bg_log_info "Press Ctrl+C to stop monitoring"
+
+    while true; do
+        # Get current build number and info
+        local build_number
+        build_number=$(get_last_build_number "$job_name")
+
+        if [[ "$build_number" == "0" || -z "$build_number" ]]; then
+            bg_log_essential "Waiting for first build of $job_name..."
+            build_number=$(_follow_wait_for_new_build "$job_name" "0")
+        fi
+
+        local build_json
+        build_json=$(get_build_info "$job_name" "$build_number")
+
+        if [[ -z "$build_json" ]]; then
+            bg_log_error "Failed to fetch build information"
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+
+        local building
+        building=$(echo "$build_json" | jq -r '.building // false')
+
+        # If build is in progress, display banner and monitor until completion
+        if [[ "$building" == "true" ]]; then
+            bg_log_info "Build #${build_number} is in progress, monitoring..."
+            # Display build info banner before entering monitoring loop
+            # Spec: unify-follow-log-spec.md, Section 5 (buildgit status -f)
+            _display_build_in_progress_banner "$job_name" "$build_number" "(so far)"
+            _monitor_build "$job_name" "$build_number"
+            # Display build completion (test results if applicable + Finished line)
+            # Spec: unify-follow-log-spec.md, Section 4 (Build Completion)
+            _handle_build_completion "$job_name" "$build_number" || true
+        else
+            # Build already completed - display full header matching snapshot mode
+            # Spec: bug-status-f-missing-header-spec.md
+            _display_completed_build "$job_name" "$build_number" "$build_json" || true
+        fi
+
+        # Show waiting message (always shown - essential output)
+        echo ""
+        log_info "Waiting for next build of $job_name..."
+
+        # Wait for a new build to start
+        local new_build_number
+        new_build_number=$(_follow_wait_for_new_build "$job_name" "$build_number")
+
+        bg_log_info "New build #${new_build_number} detected"
+    done
+}
+
+# Validate Jenkins environment, resolve job name, verify connectivity
+# Usage: _validate_jenkins_setup "context-for-errors"
+# Sets: _VALIDATED_JOB_NAME
+# Returns: 0 on success, 1 on failure (with appropriate error messages)
+_validate_jenkins_setup() {
+    local context="$1"  # e.g., "monitor Jenkins builds", "trigger Jenkins build"
+
+    if ! validate_dependencies; then
+        bg_log_error "Cannot ${context} - missing dependencies (jq, curl)"
+        bg_log_essential "Suggestion: Install jq and curl, then retry"
+        return 1
+    fi
+
+    if ! validate_environment; then
+        bg_log_error "Cannot ${context} - environment not configured"
+        bg_log_essential "Suggestion: Set JENKINS_URL, JENKINS_USER_ID, and JENKINS_API_TOKEN"
+        return 1
+    fi
+
+    if [[ -n "$JOB_NAME" ]]; then
+        _VALIDATED_JOB_NAME="$JOB_NAME"
+        bg_log_info "Using specified job: $_VALIDATED_JOB_NAME"
+    else
+        bg_log_info "Discovering Jenkins job name..."
+        if ! _VALIDATED_JOB_NAME=$(discover_job_name); then
+            bg_log_error "Cannot ${context} - could not determine job name"
+            bg_log_essential "Suggestion: Use -j/--job to specify job name"
+            return 1
+        fi
+        bg_log_success "Job name: $_VALIDATED_JOB_NAME"
+    fi
+
+    bg_log_info "Verifying Jenkins connectivity..."
+    if ! verify_jenkins_connection; then
+        bg_log_error "Cannot ${context} - cannot connect to Jenkins"
+        bg_log_essential "Suggestion: Check JENKINS_URL and credentials"
+        return 1
+    fi
+
+    if ! verify_job_exists "$_VALIDATED_JOB_NAME"; then
+        bg_log_error "Cannot ${context} - job not found: $_VALIDATED_JOB_NAME"
+        bg_log_essential "Suggestion: Verify job name with -j/--job option"
+        return 1
+    fi
+
+    return 0
+}
+
+# Status command handler
+# Displays Jenkins build status
+# Spec reference: buildgit-spec.md, buildgit status
+# Error handling: buildgit-spec.md, Error Handling section
+cmd_status() {
+    # Parse status-specific options
+    _parse_status_options "$@"
+
+    # For follow mode, jump straight to Jenkins monitoring
+    if [[ "$STATUS_FOLLOW_MODE" == "true" ]]; then
+        # Validate and setup Jenkins connection
+        if ! _validate_jenkins_setup "monitor Jenkins builds"; then
+            return 1
+        fi
+
+        # Enter follow mode loop (never returns normally)
+        _cmd_status_follow "$_VALIDATED_JOB_NAME" "$STATUS_JSON_MODE"
+        # Should not reach here
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Display Jenkins build status
+    # -------------------------------------------------------------------------
+    if ! _validate_jenkins_setup "check Jenkins status"; then
+        return 1
+    fi
+
+    _jenkins_status_check "$_VALIDATED_JOB_NAME" "$STATUS_JSON_MODE"
+}
+
+# =============================================================================
+# Push Command Implementation
+# =============================================================================
+
+# Parse push command options
+# Separates buildgit options (--no-follow) from git push options
+# Sets: PUSH_NO_FOLLOW, PUSH_GIT_ARGS
+_parse_push_options() {
+    PUSH_NO_FOLLOW=false
+    PUSH_GIT_ARGS=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-follow)
+                PUSH_NO_FOLLOW=true
+                shift
+                ;;
+            *)
+                # Pass through to git push
+                PUSH_GIT_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# Wait for a new build to start
+# Usage: _wait_for_build_start "job-name" "baseline-build-number" ["queue-url"]
+# When queue_url is provided, tries the queue API first (for triggered builds).
+# Otherwise, or on queue API failure, falls back to polling by build number.
+# Returns: new build number on stdout, 1 on timeout
+_wait_for_build_start() {
+    local job_name="$1"
+    local baseline="$2"
+    local queue_url="${3:-}"
+    local build_start_timeout="${BUILD_START_TIMEOUT:-120}"
+
+    bg_log_progress "Waiting for Jenkins build $job_name to start..."
+
+    # If queue_url provided, try queue API first
+    if [[ -n "$queue_url" ]]; then
+        local build_number
+        build_number=$(wait_for_queue_item "$queue_url" "$build_start_timeout")
+        if [[ -n "$build_number" ]]; then
+            bg_log_success "Build #${build_number} started"
+            echo "$build_number"
+            return 0
+        fi
+    fi
+
+    # Poll for new build number
+    local elapsed=0
+    local queued_notified=false
+
+    while [[ $elapsed -lt $build_start_timeout ]]; do
+        local current
+        current=$(get_last_build_number "$job_name")
+
+        if [[ "$current" -gt "$baseline" ]]; then
+            bg_log_success "Build #${current} started"
+            echo "$current"
+            return 0
+        fi
+
+        # Check if job is queued
+        if [[ "$queued_notified" == false ]]; then
+            local queue_response
+            queue_response=$(jenkins_api "/queue/api/json" 2>/dev/null) || true
+            if [[ -n "$queue_response" ]]; then
+                local queue_id
+                queue_id=$(echo "$queue_response" | jq -r --arg job "$job_name" \
+                    '.items[] | select(.task.name == $job) | .id' 2>/dev/null | head -1)
+                if [[ -n "$queue_id" ]]; then
+                    bg_log_info "Job is queued, waiting for executor..."
+                    queued_notified=true
+                fi
+            fi
+        fi
+
+        sleep "$POLL_INTERVAL"
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    bg_log_error "Timeout: No build started within ${build_start_timeout} seconds"
+    return 1
+}
+
+# Monitor push-triggered build until completion
+# Arguments: job_name, build_number
+# Returns: 0 on success, 1 on failure
+# _push_monitor_build removed - consolidated into _monitor_build()
+# Spec: unify-follow-log-spec.md, Implementation Requirements
+
+# Display build result after push
+# Arguments: job_name, build_number
+# Returns: 0 if build succeeded, 1 otherwise
+# Handle build completion display (unified format)
+# Called after _monitor_build() returns 0
+# Shows test results (if failed/unstable) and "Finished: STATUS" line
+# Arguments: job_name, build_number
+# Returns: 0 for SUCCESS, 1 for FAILURE/UNSTABLE/other
+# Spec: unify-follow-log-spec.md, Section 4 (Build Completion)
+_handle_build_completion() {
+    local job_name="$1"
+    local build_number="$2"
+
+    # Fetch final build info
+    local build_json
+    build_json=$(get_build_info "$job_name" "$build_number")
+    local result
+    result=$(echo "$build_json" | jq -r '.result // "UNKNOWN"')
+
+    # Display failure details if applicable (UNSTABLE or FAILURE)
+    if [[ "$result" == "UNSTABLE" || "$result" == "FAILURE" ]]; then
+        # Check for early failure (no stages ran) - show full console
+        # Spec: buildgit-early-build-failure-spec.md
+        local console_output
+        console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
+        if ! _display_early_failure_console "$job_name" "$build_number" "$console_output"; then
+            # Stages exist - use existing test results logic
+            # Spec: unify-follow-log-spec.md, Section 4 (Build Completion) - test failure details
+            local test_results_json
+            test_results_json=$(fetch_test_results "$job_name" "$build_number")
+            if [[ -n "$test_results_json" ]]; then
+                display_test_results "$test_results_json"
+            fi
+
+            # Show console log output when --console is specified
+            # Spec: console-on-unstable-spec.md, Section 3 (Behavior With --console)
+            if [[ -n "${CONSOLE_MODE:-}" ]]; then
+                local has_test_failures=false
+                if [[ -n "$test_results_json" ]]; then
+                    local fail_count
+                    fail_count=$(echo "$test_results_json" | jq -r '.failCount // 0') || fail_count=0
+                    if [[ "$fail_count" -gt 0 ]]; then
+                        has_test_failures=true
+                    fi
+                fi
+
+                if [[ "${CONSOLE_MODE}" =~ ^[0-9]+$ ]]; then
+                    echo ""
+                    echo "=== Console Log (last ${CONSOLE_MODE} lines) ==="
+                    echo "$console_output" | tail -"${CONSOLE_MODE}"
+                    echo "================================================"
+                elif [[ "${CONSOLE_MODE}" == "auto" ]]; then
+                    _display_error_logs "$job_name" "$build_number" "$console_output"
+                fi
+            fi
+        fi
+    fi
+
+    # Print final status line
+    echo ""
+    print_finished_line "$result"
+
+    # Return appropriate exit code
+    if [[ "$result" == "SUCCESS" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Push command handler
+# Pushes commits and monitors the resulting Jenkins build
+# Spec reference: buildgit-spec.md, buildgit push
+# Error handling: buildgit-spec.md, Error Handling section
+cmd_push() {
+    # Parse push-specific options
+    _parse_push_options "$@"
+
+    # -------------------------------------------------------------------------
+    # Part 1: Execute git push
+    # -------------------------------------------------------------------------
+    bg_log_info "Pushing to remote..."
+
+    # Capture git push output and exit code
+    local git_output
+    local git_exit_code=0
+    git_output=$(git push "${PUSH_GIT_ARGS[@]+"${PUSH_GIT_ARGS[@]}"}" 2>&1) || git_exit_code=$?
+
+    # Always display git push output (essential output)
+    if [[ -n "$git_output" ]]; then
+        bg_log_essential "$git_output"
+    fi
+
+    # If git push failed, exit with git's exit code
+    # Spec: Git command fails - return git's exit code
+    if [[ $git_exit_code -ne 0 ]]; then
+        return $git_exit_code
+    fi
+
+    # Check if there was nothing to push
+    # Git push returns 0 with "Everything up-to-date" when nothing to push
+    if [[ "$git_output" == *"Everything up-to-date"* ]]; then
+        bg_log_info "Nothing to push"
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Part 2: If --no-follow, exit after push
+    # -------------------------------------------------------------------------
+    if [[ "$PUSH_NO_FOLLOW" == "true" ]]; then
+        # Use essential output since this confirms the user's explicit request
+        bg_log_essential "Push completed (monitoring disabled)"
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Part 3: Monitor Jenkins build
+    # -------------------------------------------------------------------------
+    # Spec: Jenkins Unavailable - Complete git push (done above), then show Jenkins error
+    if ! _validate_jenkins_setup "monitor Jenkins build"; then
+        bg_log_success "Git push completed successfully"
+        return 1
+    fi
+    local job_name="$_VALIDATED_JOB_NAME"
+
+    # Record baseline build number
+    local baseline_build
+    baseline_build=$(get_last_build_number "$job_name")
+    bg_log_info "Current build baseline: #${baseline_build}"
+
+    # Wait for new build to start
+    local new_build_number
+    if ! new_build_number=$(_wait_for_build_start "$job_name" "$baseline_build" ""); then
+        bg_log_success "Git push completed successfully"
+        bg_log_error "Jenkins build monitoring failed - no build started"
+        bg_log_essential "Suggestion: Check Jenkins webhook/SCM polling configuration"
+        return 1
+    fi
+
+    # Display unified build header before monitoring
+    # Spec: unify-follow-log-spec.md, Section 5 (buildgit push)
+    _display_build_in_progress_banner "$job_name" "$new_build_number"
+
+    # Monitor build until completion
+    if ! _monitor_build "$job_name" "$new_build_number"; then
+        bg_log_error "Build monitoring interrupted or timed out"
+        bg_log_essential "Suggestion: Check Jenkins console at ${JENKINS_URL}/job/${job_name}/${new_build_number}/console"
+        return 1
+    fi
+
+    # Display build result (blank line separator)
+    echo ""
+    _handle_build_completion "$job_name" "$new_build_number"
+}
+
+# =============================================================================
+# Build Command Implementation
+# =============================================================================
+
+# Parse build command options
+# Separates buildgit options (--no-follow) from other options
+# Sets: BUILD_NO_FOLLOW
+_parse_build_options() {
+    BUILD_NO_FOLLOW=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-follow)
+                BUILD_NO_FOLLOW=true
+                shift
+                ;;
+            *)
+                # Unknown option for build command
+                bg_log_error "Unknown option for build command: $1"
+                return 1
+                ;;
+        esac
+    done
+}
+
+# Monitor triggered build until completion
+# Arguments: job_name, build_number
+# Returns: 0 on completion, 1 on error
+# _build_monitor removed - consolidated into _monitor_build()
+# Spec: unify-follow-log-spec.md, Implementation Requirements
+
+# Build command handler
+# Triggers a Jenkins build and monitors it until completion
+# Spec reference: buildgit-spec.md, buildgit build
+# Error handling: buildgit-spec.md, Error Handling section
+cmd_build() {
+    # Parse build-specific options
+    if ! _parse_build_options "$@"; then
+        return 1
+    fi
+
+    # -------------------------------------------------------------------------
+    # Part 1: Validate environment, connection, and resolve job name
+    # -------------------------------------------------------------------------
+    # Spec: Jenkins Unavailable for build - Fail immediately with descriptive error
+    if ! _validate_jenkins_setup "trigger Jenkins build"; then
+        return 1
+    fi
+    local job_name="$_VALIDATED_JOB_NAME"
+
+    # -------------------------------------------------------------------------
+    # Part 2: Trigger the build
+    # -------------------------------------------------------------------------
+    bg_log_info "Triggering build for job '$job_name'..."
+
+    local queue_url
+    if ! queue_url=$(trigger_build "$job_name"); then
+        bg_log_error "Failed to trigger build for job '$job_name'"
+        bg_log_essential "Suggestion: Check Jenkins permissions - user may need 'Build' permission for this job"
+        return 1
+    fi
+
+    bg_log_success "Build triggered successfully"
+
+    # -------------------------------------------------------------------------
+    # Part 4: Handle --no-follow mode
+    # -------------------------------------------------------------------------
+    if [[ "$BUILD_NO_FOLLOW" == "true" ]]; then
+        bg_log_essential "Build queued for job '$job_name' (monitoring disabled)"
+        if [[ -n "$queue_url" ]]; then
+            bg_log_info "Queue item: $queue_url"
+        fi
+        return 0
+    fi
+
+    # -------------------------------------------------------------------------
+    # Part 5: Wait for build to start and monitor
+    # -------------------------------------------------------------------------
+    local baseline_build
+    baseline_build=$(get_last_build_number "$job_name")
+
+    local build_number
+    if ! build_number=$(_wait_for_build_start "$job_name" "$baseline_build" "$queue_url"); then
+        bg_log_error "Build did not start within timeout"
+        bg_log_essential "Suggestion: Check Jenkins queue at ${JENKINS_URL}/queue/"
+        return 1
+    fi
+
+    # Display unified build header before monitoring
+    # Spec: unify-follow-log-spec.md, Section 5 (buildgit build)
+    _display_build_in_progress_banner "$job_name" "$build_number"
+
+    # Monitor build until completion
+    if ! _monitor_build "$job_name" "$build_number"; then
+        bg_log_error "Build monitoring interrupted or timed out"
+        bg_log_essential "Suggestion: Check Jenkins console at ${JENKINS_URL}/job/${job_name}/${build_number}/console"
+        return 1
+    fi
+
+    # Display build result (blank line separator)
+    echo ""
+    _handle_build_completion "$job_name" "$build_number"
+}
+
+cmd_passthrough() {
+    # Execute git with the command and all arguments
+    # Returns git's exit code
+    # Spec reference: buildgit-spec.md, Unknown Commands
+    git "$@"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    parse_global_options "$@"
+
+    # If no command provided, show usage and exit
+    if [[ -z "$COMMAND" ]]; then
+        show_usage
+        exit 1
+    fi
+
+    # Command routing (placeholder - to be implemented in Chunk 3)
+    case "$COMMAND" in
+        status) cmd_status "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
+        push)   cmd_push "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
+        build)  cmd_build "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
+        *)      cmd_passthrough "$COMMAND" "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
+    esac
+}
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+# Guard for testing - allows sourcing without executing main
+if [[ -z "${_BUILDGIT_TESTING:-}" ]]; then
+    main "$@"
+fi
