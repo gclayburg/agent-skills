@@ -26,9 +26,20 @@ Individual `*-spec.md` files are treated as the specification for each featureâ€
 
 ### Before writing the spec
 
-- Read all input/reference files first, then ask clarifying questions about anything that needs clarification
-- Read all files matching `*-spec.md` in the project's `specs/` directory; newer specs take priority over older ones
-- Check `specs/README.md` for the existing spec index
+1. Read all input/reference files first
+2. Read all files matching `*-spec.md` in the project's `specs/` directory; newer specs take priority over older ones
+3. Check `specs/README.md` for the existing spec index
+
+### STOP: Ask clarifying questions
+
+**Do NOT proceed to writing the spec until this step is complete.**
+
+Present your questions to the user about:
+- Anything that needs clarification in the input
+- Any incompatibilities found with existing specs
+- Recommendations or design choices you see
+
+Wait for the user's answers before writing the spec document.
 
 ### Naming convention
 
@@ -115,7 +126,6 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 ### Before writing code
 
 - [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing.
-  - Use the project's configured test runner (specified in the project's `CLAUDE.md` or `specs/CLAUDE.md`)
 
 ### Implement the feature or fix
 
@@ -148,13 +158,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 ---
 
-## Chunk Plan Files `*-chunkplan.md`
-
-- Chunk plan files are optional and only used to break down large specs into manageable chunks for independent execution.
-- Plan files are created in `specs/`, not `specs/todo/` â€” they are ready-to-implement artifacts.
-- See `references/taskcreator.md` in this skill for details on how plans and chunks are created and implemented.
-
-### Multi-chunk plan workflow tiers
+## Multi-chunk plan workflow tiers
 
 When implementing a spec via a chunk plan, the workflow is split into two tiers:
 

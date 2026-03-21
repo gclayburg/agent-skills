@@ -29,7 +29,27 @@ what is the build status
 push the staged changes and monitor the build.  fix any errors you find.
 ```
 
+## Agent Workflow: Common Patterns
 
+**IMPORTANT: `build` and `push` already follow the build to completion by default.**
+Do NOT run `status -f` after `build` or `push` — that is redundant. The `-f` flag is only valid on the `status` subcommand.
+
+| Goal | Command |
+|------|---------|
+| Commit is pushed, trigger a new build and watch it | `scripts/buildgit build` |
+| Push unpushed commits and watch the resulting build | `scripts/buildgit push` |
+| Watch a build that is already running or about to start | `scripts/buildgit status -f --once=60` |
+| Check what the last build did (already finished) | `scripts/buildgit status` |
+| Trigger a build without monitoring | `scripts/buildgit build --no-follow` |
+
+**When to use `build` vs `push`:**
+- Use `push` when you have commits to push — it pushes first, then monitors the Jenkins build triggered by that push.
+- Use `build` when commits are already pushed (e.g. triggering a retry, or someone else pushed) — it triggers Jenkins directly without a git push.
+- Do NOT use `push` if there is nothing to push; it will say "Everything up-to-date" and may not trigger a build.
+
+**`-f` flag only works with `status`**, not with `build` or `push`. These are wrong:
+- ~~`buildgit build -f`~~ — invalid, will error
+- ~~`buildgit push -f`~~ — invalid, will error
 
 ## Commands
 
