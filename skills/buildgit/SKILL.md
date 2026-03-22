@@ -29,10 +29,13 @@ what is the build status
 push the staged changes and monitor the build.  fix any errors you find.
 ```
 
+
 ## Agent Workflow: Common Patterns
 
 **IMPORTANT: `build` and `push` already follow the build to completion by default.**
 Do NOT run `status -f` after `build` or `push` — that is redundant. The `-f` flag is only valid on the `status` subcommand.
+
+Invoke commands from the skill directory, or use the full path to `scripts/buildgit` relative to this SKILL.md
 
 | Goal | Command |
 |------|---------|
