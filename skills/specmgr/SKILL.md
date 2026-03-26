@@ -66,15 +66,30 @@ Include the following fields at the top of every DRAFT spec:
 - Set to `true` if the spec should be broken into a chunk plan before implementation. Set to `false` if it can be implemented in a single pass.
 - Consider `true` when: the spec touches many files across different subsystems, requires multiple independent features or phases, has complex test strategy spanning several areas, or would exceed what an agent can reliably implement and test in one session.
 - Consider `false` when: the changes are mechanical/uniform (e.g., same pattern applied across many call sites), the scope is limited to one subsystem, or the spec is a straightforward bug fix.
-- This is a recommendation for the human reviewer — the plan is not created until after review.
+- This is a recommendation for the human reviewer — the chunk plan is not created until after review.
 
 ### Root cause analysis
 
 If the raw issue is a bug or something broken, perform a root cause analysis and include that in the spec.
 
-### Companion manual test plan
+### Companion agent test plan
 
-Always create a companion manual test plan file alongside the spec: `<spec-basename>-test-plan.md` (e.g., `2026-03-14_condense-build-header-spec.md` → `2026-03-14_condense-build-header-test-plan.md`). The test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the test plan from a `## Manual Test Plan` section at the end of the spec (before the `## SPEC workflow` section).
+Always create a companion agent test plan file alongside the spec: `<spec-basename>-agent-test-plan.md` (e.g., `2026-03-14_condense-build-header-spec.md` → `2026-03-14_condense-build-header-agent-test-plan.md`). The agent test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the agent test plan from a `## Agent Test Plan` section at the end of the spec (before the `## SPEC workflow` section).
+
+### Agent test plan guidelines
+The point of an agent test plan is to validate that once a spec is implemented, that all the components exist together as part of a coheseive whole.  e.g.
+
+- website (if any) can start up without errors
+- expected website content is visible
+- cli tool (if any) can run with options modified under spec
+- execute basic functionality against known external data according to the spec
+
+A test plan is not:
+- a substitute for a unit test
+- a substitute for an end to end test
+- a substitute for an integration test
+- a substitute for passing all CI/CD tests
+- a comprehensive test of everything changed in the spec
 
 ### SPEC workflow section
 
@@ -148,13 +163,14 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 ## Spec State Machine
 
 - **DRAFT**: Spec written, not yet implemented.
-- **IMPLEMENTED**: Code written, tests passing, docs updated.
-- **VALIDATED**: Human has manually verified the implementation.
+- **IMPLEMENTED**: Code written, tests passing, docs updated. This is the normal post-implementation resting state and it is acceptable for a spec or its chunks to remain here indefinitely until a human validation pass happens.
+- **VALIDATED**: Human has manually verified the implementation. Validation is a separate later step from implementation.
 
 ### IMPLEMENTED → VALIDATED
 
 - Perform all manual testing to make sure the change does what it claims (human does this)
 - Mark the `State:` of the spec to `VALIDATED`
+- For chunked work, it is valid to move every completed chunk from `IMPLEMENTED` to `VALIDATED` in one later pass after the human verifies the integrated feature end-to-end. Do not require each chunk to be validated immediately after its implementation.
 
 ---
 
@@ -170,7 +186,11 @@ When implementing a spec via a chunk plan, the workflow is split into two tiers:
 - Write/update unit tests
 - Run all unit tests
 - Run manual test plan if the spec references one
-- Fill in the chunk's `#### Implementation Log`
+- Leave the chunk in `IMPLEMENTED` after its code and tests are done; human validation may happen later for all chunks together
+- When chunk is done:
+1. Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
+2. Fill in the chunk's `#### Implementation Log`
+
 - Commit (with chunk number in message, e.g. `"chunk 3/5: implement feature X"`) and push
 
 **Finalize workflow** (runs once after all chunks complete):
@@ -180,5 +200,6 @@ When implementing a spec via a chunk plan, the workflow is split into two tiers:
 - Update CLAUDE.md if any user-facing interface changes
 - Run any additional project-specific finalize steps (per project's CLAUDE.md)
 - Push and verify CI
+- Human validation may later move the completed chunks and/or parent spec from `IMPLEMENTED` to `VALIDATED` in a single follow-up pass
 
 Single-spec implementation (without a plan) continues to do everything in one pass as described above.
