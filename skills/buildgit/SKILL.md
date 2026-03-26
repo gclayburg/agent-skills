@@ -29,6 +29,18 @@ what is the build status
 push the staged changes and monitor the build.  fix any errors you find.
 ```
 
+```
+I started a build already.  monitor it and fix anything that breaks
+```
+
+```
+start a build and fix anything that breaks
+```
+
+```
+my jenkins build is slow.  make it go faster with the new build agents online now
+```
+
 
 ## Agent Workflow: Common Patterns
 
