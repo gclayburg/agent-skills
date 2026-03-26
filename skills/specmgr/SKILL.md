@@ -138,21 +138,51 @@ The SPEC Workflow block embedded in plans must use generic language:
 
 When implementing a DRAFT spec or bug fix, follow these steps in order.
 
-### Before writing code
+### 3a Before writing code
 
-- [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing.
+- [ ] **Check for chunk plan** if there is a chunk plan use Workflow 4 instead of this one
+- [ ] **Check build status** and confirm the last build is successful. Do not proceed if the build is setup but broken.  It is ok if there is no build setup for this project yet.
+- [ ] **Run all unit tests** and confirm they pass. Do not proceed if there are existing tests but they are failing.
 
-### Implement the feature or fix
+### 3b Implement the feature or fix
 
 - [ ] **Write the code** as described in the spec's Specification section.
 - [ ] **Write or update unit tests** as described in the spec's Test Strategy section.
 - [ ] **Run all unit tests** and confirm they pass (both new and existing).
 
-### Run manual test plan (if present)
+### 3c Run agent test plan (if present)
 
-- [ ] **Check if the spec references a manual test plan** (look for a `## Manual Test Plan` section or a companion `*-test-plan.md` file). If one exists, execute every test command in the plan against the real CLI tool and verify the results match the expected output. If any test fails, fix the code and re-run until all tests pass. Do not skip this step — unit tests alone are not sufficient to prove the implementation works end-to-end.
+- [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
 
-### Update documentation and metadata
+### 3d Update documentation and metadata
+
+- [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
+- [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
+- [ ] **Run any additional project-specific finalize steps** as specified in the project's `CLAUDE.md` or `specs/CLAUDE.md`. This is the extension point where project-specific documentation updates, skill file updates, and custom push/CI commands are executed.
+
+## Workflow 4: Implement DRAFT Spec using chunk plan (DRAFT → IMPLEMENTED)
+
+**Triggers:** "implement DRAFT spec with chunk plan ...", "implement chunk X from chunk plan..."
+
+### 4a Before writing code
+- [ ] **Check for chunk plan** if there is no chunk plan, use Workflow 3 instead of this one
+- [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing.
+
+### 4b Per-Chunk Workflow (every chunk must follow these steps)
+
+- [ ]  **Implement the chunk** as described in its Implementation Details section.
+- [ ]  **Write or update unit tests** as described in the chunk's Test Plan section.
+- [ ]  **Run all unit tests** and confirm they pass (both new and existing).
+- [ ]  **Mark chunk complete** Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
+- [ ]  **Fill in the `#### Implementation Log`** for the chunk you implemented — summarize files changed, key decisions, and anything notable.
+- [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
+- [ ]  **Fix build errors** Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary.
+
+### 4c Run agent test plan (if present)
+
+- [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
+
+### 4d Update documentation and metadata
 
 - [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
 - [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
@@ -176,28 +206,16 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 ## Multi-chunk plan workflow tiers
 
-When implementing a spec via a chunk plan, the workflow is split into two tiers:
+When implementing a spec via a chunk plan, the workflow is split into tiers as documented in `references/taskcreator.md`
 
 **Initialize workflow** (runs before any chunks are implemented)
 - Run all unit tests before starting
 
 **Per-chunk workflow** (each chunk does these):
-- Implement the chunk
-- Write/update unit tests
-- Run all unit tests
-- Run manual test plan if the spec references one
-- Leave the chunk in `IMPLEMENTED` after its code and tests are done; human validation may happen later for all chunks together
-- When chunk is done:
-1. Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
-2. Fill in the chunk's `#### Implementation Log`
-
-- Commit (with chunk number in message, e.g. `"chunk 3/5: implement feature X"`) and push
 
 **Finalize workflow** (runs once after all chunks complete):
 - Update CHANGELOG.md, README.md, and any other project documentation
-- Update the spec file state to IMPLEMENTED
-- Move reference files to `specs/done-reports/`
-- Update CLAUDE.md if any user-facing interface changes
+
 - Run any additional project-specific finalize steps (per project's CLAUDE.md)
 - Push and verify CI
 - Human validation may later move the completed chunks and/or parent spec from `IMPLEMENTED` to `VALIDATED` in a single follow-up pass

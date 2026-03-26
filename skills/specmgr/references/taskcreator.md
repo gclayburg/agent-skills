@@ -71,20 +71,5 @@ Every generated chunk plan must include a `## SPEC Workflow` section after the `
 
 **Parent spec:** `<path-to-parent-spec-file.md>`
 
-Read `specs/CLAUDE.md` for full workflow rules. The workflow below applies to chunk plan implementation.
-
-### Initialize Workflow
-- Run all unit tests before starting
-
-### Per-Chunk Workflow (every chunk must follow these steps)
-
-1. **Implement the chunk** as described in its Implementation Details section.
-2. **Write or update unit tests** as described in the chunk's Test Plan section.
-3. **Run all unit tests** and confirm they pass (both new and existing).
-4. **Fill in the `#### Implementation Log`** for the chunk you implemented — summarize files changed, key decisions, and anything notable.
-5. **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
-
-### Finalize Workflow (after ALL chunks are complete)
-
-After all chunks have been implemented, a finalize step runs automatically. The finalize agent reads the entire plan file (including all Implementation Log entries) and performs the finalize steps defined in the `specmgr` skill and in the project's `CLAUDE.md` or `specs/CLAUDE.md`.
+Read `specs/CLAUDE.md` and specmgr skill for full workflow rules to implement DRAFT spec with chunk plan.
 ```
