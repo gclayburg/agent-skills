@@ -150,6 +150,16 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ] **Write or update unit tests** as described in the spec's Test Strategy section.
 - [ ] **Run all unit tests** and confirm they pass (both new and existing).
 
+#### Existing test modification policy
+
+When your implementation causes a pre-existing test to fail, you may fix it and continue — do not stop to ask. However:
+
+1. **Determine spec backing first.** Before changing an existing test, identify which section of the spec requires the behavioral change that invalidates the old test.
+2. **If the spec backs the change:** fix the test and log the change in the implementation review log (see Implementation Review Report section).
+3. **If no spec section backs the change:** you still may fix it and continue, but you MUST log it with `Spec Backing: None` in the review log. These entries will be flagged for reviewer attention.
+4. **What counts as modifying an existing test:** changing assertions, expected values, fixture data, test domain names, or any other change whose purpose is to make a previously-passing test continue to pass under new behavior. Adding new test cases is not a modification.
+5. **Never weaken a test to avoid a failure.** Changing fixture data to sidestep new validation (e.g. removing a `.com` suffix so domain validation is never triggered) is weakening, not fixing. If the test was exercising a code path that your implementation changed, the test should still exercise that code path — with correct updated expectations.
+
 ### 3c Run agent test plan (if present)
 
 - [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
@@ -172,7 +182,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 - [ ]  **Implement the chunk** as described in its Implementation Details section.
 - [ ]  **Write or update unit tests** as described in the chunk's Test Plan section.
-- [ ]  **Run all unit tests** and confirm they pass (both new and existing).
+- [ ]  **Run all unit tests** and confirm they pass (both new and existing). The **Existing test modification policy** from Workflow 3b applies here as well.
 - [ ]  **Mark chunk complete** Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
 - [ ]  **Fill in the `#### Implementation Log`** for the chunk you implemented — summarize files changed, key decisions, and anything notable.
 - [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
@@ -215,9 +225,67 @@ When implementing a spec via a chunk plan, the workflow is split into tiers as d
 
 **Finalize workflow** (runs once after all chunks complete):
 - Update CHANGELOG.md, README.md, and any other project documentation
-
+- **Generate the implementation review report** (see below)
 - Run any additional project-specific finalize steps (per project's CLAUDE.md)
 - Push and verify CI
 - Human validation may later move the completed chunks and/or parent spec from `IMPLEMENTED` to `VALIDATED` in a single follow-up pass
 
 Single-spec implementation (without a plan) continues to do everything in one pass as described above.
+
+---
+
+## Implementation Review Report
+
+Every spec implementation — whether via chunk plan, single-pass, or follow-up bug fix — MUST produce a review report at finalize time.
+
+### File location and naming
+
+`specs/done-reports/{spec-basename}-review.md`
+
+Example: `specs/2026-03-24_claim-domain-spec.md` → `specs/done-reports/2026-03-24_claim-domain-spec-review.md`
+
+### Report template
+
+```markdown
+# Implementation Review: {spec title}
+
+**Spec:** `specs/{spec-file}.md`
+**Implemented:** {date}
+**Implementer:** {agent or human}
+
+## Existing Test Modifications
+
+| Test File | Change | Spec Backing | Rationale |
+|-----------|--------|--------------|-----------|
+
+If no existing tests were modified, write: "No existing tests were modified."
+
+## Flagged Decisions
+
+Any entry above with Spec Backing = "None" must be repeated here with additional context about why the agent proceeded without spec backing. These are the items that most need reviewer attention.
+
+## Files Changed (alphabetical)
+
+- `path/to/modified-file.ext`
+
+List only project files that were modified (not created) by this implementation. Exclude temporary files, build artifacts, and generated output.
+
+## Files Created (alphabetical)
+
+- `path/to/new-file.ext`
+
+List only new project files added by this implementation. Exclude temporary files, build artifacts, and generated output.
+
+## Key Implementation Decisions
+
+- {notable design decisions, trade-offs, or deviations from the spec, one per bullet}
+
+## Consolidation
+
+If a chunk plan was used, summarize each chunk's Implementation Log entry here (one bullet per chunk). This provides a single-file view of the entire implementation.
+```
+
+### How the report is built
+
+- **During implementation:** Each time you modify an existing test, immediately append a row to a scratch log (the chunk's `#### Implementation Log` if using a chunk plan, or a temporary `## Implementation Review Notes` section at the bottom of the spec file if not). Do not defer this — log it when you make the change.
+- **At finalize time:** Consolidate all logged entries into the review report file. Remove any temporary scratch sections from the spec file.

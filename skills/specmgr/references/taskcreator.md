@@ -50,7 +50,7 @@ Plan file naming, location, and Chunkplan header updates are defined in SKILL.md
 ## Definition of done
 - all unit tests written as a part of this task have been executed and they pass
 - all unit tests of the entire project also are still passing
-- if you find that this new feature starts to cause the test failure of an existing test, use your judgement to examine and fix either the implementation code or the test code
+- if this new feature causes an existing test to fail, fix it and continue — but log every such change per the specmgr implementation workflow's existing test modification policy (in SKILL.md). Never weaken a test to sidestep new validation.
 
 ## Size and Scope
 - Decompose this specification into LLM-sized chunks.
