@@ -176,7 +176,7 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 
 ### 4a Before writing code
 - [ ] **Check for chunk plan** if there is no chunk plan, use Workflow 3 instead of this one
-- [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing.
+- [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing. If the test commands themselves are broken (e.g. missing tools, build infrastructure failures, repository configuration errors), do NOT skip tests and continue — this is a blocking failure. Output `RALPH_BLOCKED=<reason>` as the final line and stop.
 
 ### 4b Per-Chunk Workflow (every chunk must follow these steps)
 
@@ -187,6 +187,8 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 - [ ]  **Fill in the `#### Implementation Log`** for the chunk you implemented — summarize files changed, key decisions, and anything notable.
 - [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
 - [ ]  **Fix build errors** Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary.
+
+**Blocking failure rule:** If at any point during the per-chunk workflow you encounter a failure that you cannot fix (broken build infrastructure, missing tools, repository configuration errors, or test failures unrelated to your chunk's changes), do NOT output `REMAINING_CHUNKS=n`. Instead, output `RALPH_BLOCKED=<brief reason>` as the final line and stop immediately. Do not attempt the next chunk.
 
 ### 4c Run agent test plan (if present)
 
