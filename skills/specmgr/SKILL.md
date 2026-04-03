@@ -43,8 +43,8 @@ Wait for the user's answers before writing the spec document.
 
 ### Naming convention
 
-- Filename format: `specs/YYYY-MM-DD_<name>-spec.md` (date in America/Denver TZ)
-- The `<name>` portion is derived from the input file or feature name (e.g., `featurereport74.md` → `specs/2026-02-15_featurereport74-spec.md`)
+- Filename format: `specs/<name>-spec.md`
+- The `<name>` portion is derived from the input file or feature name (e.g., `featurereport74.md` → `specs/featurereport74-spec.md`)
 
 ### Spec template
 
@@ -74,7 +74,7 @@ If the raw issue is a bug or something broken, perform a root cause analysis and
 
 ### Companion agent test plan
 
-Always create a companion agent test plan file alongside the spec: `<spec-basename>-agent-test-plan.md` (e.g., `2026-03-14_condense-build-header-spec.md` → `2026-03-14_condense-build-header-agent-test-plan.md`). The agent test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the agent test plan from a `## Agent Test Plan` section at the end of the spec (before the `## SPEC workflow` section).
+Always create a companion agent test plan file alongside the spec: `<spec-basename>-agent-test-plan.md` (e.g., `condense-build-header-spec.md` → `condense-build-header-agent-test-plan.md`). The agent test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the agent test plan from a `## Agent Test Plan` section at the end of the spec (before the `## SPEC workflow` section).
 
 ### Agent test plan guidelines
 The point of an agent test plan is to validate that once a spec is implemented, that all the components exist together as part of a coheseive whole.  e.g.
@@ -259,7 +259,7 @@ Every spec implementation — whether via chunk plan, single-pass, or follow-up 
 
 `specs/done-reports/{spec-basename}-review.md`
 
-Example: `specs/2026-03-24_claim-domain-spec.md` → `specs/done-reports/2026-03-24_claim-domain-spec-review.md`
+Example: `specs/claim-domain-spec.md` → `specs/done-reports/claim-domain-spec-review.md`
 
 ### Report template
 
