@@ -164,7 +164,14 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 
 - [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
 
-### 3d Update documentation and metadata
+### 3d Verify CI/CD build is green
+
+- [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
+  1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
+  2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
+  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the implementation review report under the `## CI/CD Verification` section (see Implementation Review Report template). Proceed to the next step.
+
+### 3e Update documentation and metadata
 
 - [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
 - [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
@@ -194,7 +201,14 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 
 - [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
 
-### 4d Update documentation and metadata
+### 4d Verify CI/CD build is green
+
+- [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
+  1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
+  2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
+  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the implementation review report under the `## CI/CD Verification` section (see Implementation Review Report template). Proceed to the next step.
+
+### 4e Update documentation and metadata
 
 - [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
 - [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
@@ -230,6 +244,7 @@ When implementing a spec via a chunk plan, the workflow is split into tiers as d
 - **Generate the implementation review report** (see below)
 - Run any additional project-specific finalize steps (per project's CLAUDE.md)
 - Push and verify CI
+- **CI/CD gate: confirm the build is GREEN before marking the spec IMPLEMENTED** (see Workflow 4d)
 - Human validation may later move the completed chunks and/or parent spec from `IMPLEMENTED` to `VALIDATED` in a single follow-up pass
 
 Single-spec implementation (without a plan) continues to do everything in one pass as described above.
@@ -261,6 +276,12 @@ Example: `specs/2026-03-24_claim-domain-spec.md` → `specs/done-reports/2026-03
 |-----------|--------|--------------|-----------|
 
 If no existing tests were modified, write: "No existing tests were modified."
+
+## CI/CD Verification
+
+Record the CI/CD build status at finalize time. One of:
+- **Build GREEN:** `<build tool> status` confirmed SUCCESS (build #N, date)
+- **No CI/CD configured:** project does not have a buildgit skill installed or no build job is configured. Spec marked IMPLEMENTED without CI/CD verification.
 
 ## Flagged Decisions
 
