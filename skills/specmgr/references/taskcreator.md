@@ -61,6 +61,7 @@ Plan file naming, location, and Chunkplan header updates are defined in SKILL.md
 ## Ordering and dependence
 - The plan will not specify an order as to which chunks should be built first.
 - The dependencies are documented so this decision of which chunk to build next can be deferred to implementation time.
+- The '## Contents' section at the top of the document should be augmented so that all dependencies between chunks are listed
 
 ## SPEC Workflow section (mandatory in every plan)
 

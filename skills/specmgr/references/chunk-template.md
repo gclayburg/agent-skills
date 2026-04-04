@@ -9,10 +9,12 @@ Use this format for each chunk in a chunk plan.
 ```markdown
 ## Contents
 
-- [ ] **Chunk A: <Chunk A Title>**
-- [ ] **Chunk B: <Chunk B Title>**
-- [ ] **Chunk C: <Chunk C Title>**
-- [ ] **Chunk N: <Chunk N Title>**
+| Status | Chunk   | Title            | Dependencies                    |
+|--------|---------|------------------|----------------------------------|
+| [ ]    | Chunk A | <Chunk A Title>  | Dependencies of chunk A, or NONE |
+| [ ]    | Chunk B | <Chunk B Title>  | Dependencies of chunk B, or NONE |
+| [ ]    | Chunk C | <Chunk C Title>  | Dependencies of chunk C, or NONE |
+| [ ]    | Chunk N | <Chunk N Title>  | Dependencies of chunk N, or NONE |
 
 
 ## Chunk Detail
