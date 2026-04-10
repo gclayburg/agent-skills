@@ -55,11 +55,27 @@ Include the following fields at the top of every DRAFT spec:
 
 - **Date:** `<ISO 8601 format with seconds, America/Denver timezone>`
 - **References:** list of `<other-raw-report-path.md>` or `<none>`
+- **AgentTestPlan:** `<path-to-agent-test-plan.md>` or `none`
 - **Supersedes:** list of `<other-spec-file.md>`
 - **Chunkplan:** `<path-to-chunkplan.md>` or `none`
 - **Chunked:** `true` or `false`
 - **State:** one of these valid values: `DRAFT`, `IMPLEMENTED`, `VALIDATED`
 ```
+
+### Header field commit contract
+
+The header fields above are the **authoritative list of files that `implement-spec.sh` will commit** alongside the spec before creating the worktree. Specifically, the commit set is:
+
+1. The spec file itself
+2. The chunk plan file (if `Chunkplan:` is set)
+3. Every path in `References:`
+4. The path in `AgentTestPlan:` (if not `none`)
+
+**No other files are auto-committed.** If a spec mentions a file in its prose (e.g. "this change affects `src/foo.ts`"), that file is NOT staged — only files explicitly listed in the header are. This means:
+
+- If you create a companion agent test plan file, you MUST record its path in the `AgentTestPlan:` header field, or it will not be committed with the spec.
+- If the spec depends on other new-but-uncommitted files (e.g. a raw bug report that needs to travel with the spec), list them in `References:`.
+- Files that are mentioned only as future-modification targets (i.e. files the implementing agent will edit) should NOT go in the header — the agent will commit those itself as part of its normal work.
 
 ### Setting the `Chunked:` field
 
@@ -74,7 +90,7 @@ If the raw issue is a bug or something broken, perform a root cause analysis and
 
 ### Companion agent test plan
 
-Always create a companion agent test plan file alongside the spec: `<spec-basename>-agent-test-plan.md` (e.g., `condense-build-header-spec.md` → `condense-build-header-agent-test-plan.md`). The agent test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the agent test plan from a `## Agent Test Plan` section at the end of the spec (before the `## SPEC workflow` section).
+Always create a companion agent test plan file alongside the spec: `<spec-basename>-agent-test-plan.md` (e.g., `condense-build-header-spec.md` → `condense-build-header-agent-test-plan.md`). The agent test plan must contain concrete CLI commands that an agent can execute to verify the implementation works end-to-end against the real tool and environment. Link the agent test plan from a `## Agent Test Plan` section at the end of the spec (before the `## SPEC workflow` section), AND record its path in the spec header's `AgentTestPlan:` field so `implement-spec.sh` commits it with the spec.
 
 ### Agent test plan guidelines
 The point of an agent test plan is to validate that once a spec is implemented, that all the components exist together as part of a coheseive whole.  e.g.
