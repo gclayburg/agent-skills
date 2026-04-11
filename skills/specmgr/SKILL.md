@@ -4,8 +4,9 @@ description: >
   Spec-driven development workflow manager. Use when: (1) creating a DRAFT spec
   from input files or raw ideas, (2) creating a chunk plan
   from a DRAFT spec, (3) implementing a DRAFT spec (DRAFT to IMPLEMENTED transition),
-  or (4) managing spec state transitions. Triggers on "create spec", "draft spec",
-  "implement spec", "chunk plan", "spec workflow", or references to *-spec.md files.
+  or (4) managing spec state transitions. Triggers on "create spec",
+  "draft spec", "implement spec", "chunk plan", "spec workflow", or references to
+  *-spec.md files.
 metadata:
   tags: spec, specification, workflow, implementation, planning, chunking
   platforms: Claude, ChatGPT, Gemini, Cursor
@@ -140,7 +141,7 @@ The SPEC Workflow block embedded in plans must use generic language:
 All implementations will have an implementation log that is modifed as needed during implementation. Guidelines:
 1. after implementation: summarize files changed, key decisions, and anything notable learned during implementation
 2. Count compaction events (system-reminder summarizing prior conversation) that occured during implementation.  If unknown, use 0.
-3. Record list of skills invoked with `Skill` tool during implementation, or `NONE`
+3. Record list of skills invoked with `Skill` tool during implementation, or `NONE`.
 
 Location of Implementation log: 
 - If implementing a DRAFT Spec not chunked, The implementation log should be created in a new section `#### Implementation Log` at the bottom of the spec file
@@ -187,7 +188,9 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
   1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
   2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
-  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to the step 5 (Finalize).
+  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to **Workflow 5 (Finalize)**.
+
+**Before finalize:** Workflow 5 includes a **mandatory** work review (§5c). You **must** read and run the `workreview` skill before setting `State:` to `IMPLEMENTED`. Skipping workreview is not allowed.
 
 
 ## Workflow 4: Implement DRAFT Spec using chunk plan (DRAFT → IMPLEMENTED)
@@ -213,6 +216,8 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 ### Workflow 5 Finalize Implementation
 
+Use this workflow **after** Workflow 3 (single-pass) or **after** all chunks in Workflow 4 are complete. All Steps in Workflow 5 are **MANDATORY** when implementing a spec or a chunkplan.
+
 
 ### 5a Run agent test plan (if present)
 
@@ -225,19 +230,25 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
   2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
   3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to the next step.
 
-### 5c Update documentation and metadata
+### 5c Work review report — 
+
+- [ ] **Read the `workreview` skill** — locate `workreview/SKILL.md` (commonly under `.agents/skills/workreview/` or `.claude/skills/workreview/` in the repo or user skills path) and follow it completely.
+- [ ] **Run workreview** — produce the implementation review report (default path: `specs/done-reports/{spec-basename}-review.md`.
+
+If the `workreview` skill is missing from the environment, stop and report that as a **blocking** finalize failure — do not mark the spec IMPLEMENTED without the review artifact.
+
+### 5d Update documentation and metadata
 
 - [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
 - [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
 - [ ] **Run any additional project-specific finalize steps** as specified in the project's `CLAUDE.md` or `specs/CLAUDE.md`. This is the extension point where project-specific documentation updates, skill file updates, and custom push/CI commands are executed.
-- [ ] **Generate the implementation review report** — delegate to the `workreview` skill, which creates `specs/done-reports/{spec-basename}-review.md` and consolidates the `#### Implementation Log` section into it
 
 ---
 
 ## Spec State Machine
 
 - **DRAFT**: Spec written, not yet implemented.
-- **IMPLEMENTED**: Code written, tests passing, docs updated. This is the normal post-implementation resting state and it is acceptable for a spec or its chunks to remain here indefinitely until a human validation pass happens.
+- **IMPLEMENTED**: Code written, tests passing, docs updated, and the **workreview** report from Workflow 5c is produced before the `State:` field is set to this value. This is the normal post-implementation resting state and it is acceptable for a spec or its chunks to remain here indefinitely until a human validation pass happens.
 - **VALIDATED**: Human has manually verified the implementation. Validation is a separate later step from implementation.
 
 ### IMPLEMENTED → VALIDATED
