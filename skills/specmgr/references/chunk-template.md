@@ -66,7 +66,10 @@ See spec [<Section Name>](./<spec-filename>.md#<anchor>) sections X.X-X.X.
 #### Implementation Log
 
 <!-- Filled in by the implementing agent after completing this chunk.
-     Summarize: files changed, key decisions, anything the finalize step needs to know. -->
+     Required fields:
+     - Files changed, key decisions, anything the finalize step needs to know
+     - Compaction events during this chunk: N (count of system-reminder compaction events observed during this chunk's agent run)
+     - Skills used during this chunk: list of skills invoked via the Skill tool, or "None" -->
 ```
 
 ---
@@ -78,4 +81,4 @@ See spec [<Section Name>](./<spec-filename>.md#<anchor>) sections X.X-X.X.
 - Spec anchors should match markdown heading IDs in the spec document
 - Test case names should use snake_case
 - Checkboxes (`- [ ]`) appear ONLY in the `## Contents` list, never in chunk detail headings — duplicate checkboxes break progress counting tools
-- The `#### Implementation Log` subsection is filled in by the implementing agent, not the plan creator
+- The `#### Implementation Log` subsection is filled in by the implementing agent (per chunk), not the plan creator.

@@ -8,7 +8,7 @@ description: >
   "implement spec", "chunk plan", "spec workflow", or references to *-spec.md files.
 metadata:
   tags: spec, specification, workflow, implementation, planning, chunking
-  platforms: Claude, ChatGPT, Gemini
+  platforms: Claude, ChatGPT, Gemini, Cursor
 ---
 
 # Spec-Driven Development Workflow Manager
@@ -44,7 +44,7 @@ Wait for the user's answers before writing the spec document.
 ### Naming convention
 
 - Filename format: `specs/<name>-spec.md`
-- The `<name>` portion is derived from the input file or feature name (e.g., `featurereport74.md` → `specs/featurereport74-spec.md`)
+- The `<name>` portion is derived from the input file or feature name (e.g., `featurereport74.md` → `specs/featurereport74-spec.md`)  New specs should NOT have a date in the filename.
 
 ### Spec template
 
@@ -64,18 +64,7 @@ Include the following fields at the top of every DRAFT spec:
 
 ### Header field commit contract
 
-The header fields above are the **authoritative list of files that `implement-spec.sh` will commit** alongside the spec before creating the worktree. Specifically, the commit set is:
-
-1. The spec file itself
-2. The chunk plan file (if `Chunkplan:` is set)
-3. Every path in `References:`
-4. The path in `AgentTestPlan:` (if not `none`)
-
-**No other files are auto-committed.** If a spec mentions a file in its prose (e.g. "this change affects `src/foo.ts`"), that file is NOT staged — only files explicitly listed in the header are. This means:
-
-- If you create a companion agent test plan file, you MUST record its path in the `AgentTestPlan:` header field, or it will not be committed with the spec.
-- If the spec depends on other new-but-uncommitted files (e.g. a raw bug report that needs to travel with the spec), list them in `References:`.
-- Files that are mentioned only as future-modification targets (i.e. files the implementing agent will edit) should NOT go in the header — the agent will commit those itself as part of its normal work.
+The header fields above are the **authoritative list of files that define the spec** These files must be added to any worktree used for implementation.
 
 ### Setting the `Chunked:` field
 
@@ -146,6 +135,27 @@ The SPEC Workflow block embedded in plans must use generic language:
 - "Commit and push" (do not hardcode a push command — the project's conventions apply)
 - "Update project documentation as specified in the project's CLAUDE.md or specs/CLAUDE.md"
 
+#### Create Implementation log 
+
+All implementations will have an implementation log that is modifed as needed during implementation. Guidelines:
+1. after implementation: summarize files changed, key decisions, and anything notable learned during implementation
+2. Count compaction events (system-reminder summarizing prior conversation) that occured during implementation.  If unknown, use 0.
+3. Record list of skills invoked with `Skill` tool during implementation, or `NONE`
+
+Location of Implementation log: 
+- If implementing a DRAFT Spec not chunked, The implementation log should be created in a new section `#### Implementation Log` at the bottom of the spec file
+- If implementing a spec with a chunkplan, the chunk plan file is the live log destination during implementation — each chunk's notes go into its own `#### Implementation Log` subsection in the chunk plan
+
+#### Existing test modification policy
+
+When your implementation causes a pre-existing test to fail, you may fix it and continue — do not stop to ask. However:
+
+1. **Determine spec backing first.** Before changing an existing test, identify which section of the spec requires the behavioral change that invalidates the old test.
+2. **If the spec backs the change:** fix the test and log the change in the `#### Implementation Log` section.
+3. **If no spec section backs the change:** you still may fix it and continue, but you MUST log it with `Spec Backing: None` in the implementation log. These entries will be flagged for reviewer attention.
+4. **What counts as modifying an existing test:** changing assertions, expected values, fixture data, test domain names, or any other change whose purpose is to make a previously-passing test continue to pass under new behavior. Adding new test cases is not a modification.
+5. **Never weaken a test to avoid a failure.** Changing fixture data to sidestep new validation (e.g. removing a `.com` suffix so domain validation is never triggered) is weakening, not fixing. If the test was exercising a code path that your implementation changed, the test should still exercise that code path — with correct updated expectations.
+
 ---
 
 ## Workflow 3: Implement DRAFT Spec (DRAFT → IMPLEMENTED)
@@ -165,16 +175,8 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ] **Write the code** as described in the spec's Specification section.
 - [ ] **Write or update unit tests** as described in the spec's Test Strategy section.
 - [ ] **Run all unit tests** and confirm they pass (both new and existing).
+- [ ] **Write implementation log notes** in a new section `#### Implementation Log`.  See `#### Create Implementation log` section above
 
-#### Existing test modification policy
-
-When your implementation causes a pre-existing test to fail, you may fix it and continue — do not stop to ask. However:
-
-1. **Determine spec backing first.** Before changing an existing test, identify which section of the spec requires the behavioral change that invalidates the old test.
-2. **If the spec backs the change:** fix the test and log the change in the implementation review log (see Implementation Review Report section).
-3. **If no spec section backs the change:** you still may fix it and continue, but you MUST log it with `Spec Backing: None` in the review log. These entries will be flagged for reviewer attention.
-4. **What counts as modifying an existing test:** changing assertions, expected values, fixture data, test domain names, or any other change whose purpose is to make a previously-passing test continue to pass under new behavior. Adding new test cases is not a modification.
-5. **Never weaken a test to avoid a failure.** Changing fixture data to sidestep new validation (e.g. removing a `.com` suffix so domain validation is never triggered) is weakening, not fixing. If the test was exercising a code path that your implementation changed, the test should still exercise that code path — with correct updated expectations.
 
 ### 3c Run agent test plan (if present)
 
@@ -185,13 +187,8 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 - [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
   1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
   2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
-  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the implementation review report under the `## CI/CD Verification` section (see Implementation Review Report template). Proceed to the next step.
+  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to the step 5 (Finalize).
 
-### 3e Update documentation and metadata
-
-- [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
-- [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
-- [ ] **Run any additional project-specific finalize steps** as specified in the project's `CLAUDE.md` or `specs/CLAUDE.md`. This is the extension point where project-specific documentation updates, skill file updates, and custom push/CI commands are executed.
 
 ## Workflow 4: Implement DRAFT Spec using chunk plan (DRAFT → IMPLEMENTED)
 
@@ -203,32 +200,37 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 
 ### 4b Per-Chunk Workflow (every chunk must follow these steps)
 
+- [ ] **Write implementation log notes** in a new section `#### Implementation Log`.  See `#### Create Implementation log` section above
+
 - [ ]  **Implement the chunk** as described in its Implementation Details section.
 - [ ]  **Write or update unit tests** as described in the chunk's Test Plan section.
 - [ ]  **Run all unit tests** and confirm they pass (both new and existing). The **Existing test modification policy** from Workflow 3b applies here as well.
 - [ ]  **Mark chunk complete** Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
-- [ ]  **Fill in the `#### Implementation Log`** for the chunk you implemented — summarize files changed, key decisions, and anything notable.
 - [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
 - [ ]  **Fix build errors** Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary.
 
-**Blocking failure rule:** If at any point during the per-chunk workflow you encounter a failure that you cannot fix (broken build infrastructure, missing tools, repository configuration errors, or test failures unrelated to your chunk's changes), do NOT output `REMAINING_CHUNKS=n`. Instead, output `RALPH_BLOCKED=<brief reason>` as the final line and stop immediately. Do not attempt the next chunk.
+**Blocking failure rule:** If at any point during the per-chunk workflow you encounter a failure that you cannot fix (broken build infrastructure, missing tools, repository configuration errors, or test failures unrelated to your chunk's changes), do NOT output `REMAINING_CHUNKS=n`. Instead, output `RALPH_BLOCKED=<brief reason>` as the final line and stop immediately. Do not attempt the next chunk. If a chunk is abandoned due to `RALPH_BLOCKED`, still record the compaction count and skills used up to the blocking point in the chunk's Implementation Log before stopping.
 
-### 4c Run agent test plan (if present)
+### Workflow 5 Finalize Implementation
+
+
+### 5a Run agent test plan (if present)
 
 - [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
 
-### 4d Verify CI/CD build is green
+### 5b Verify CI/CD build is green
 
 - [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
   1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
   2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
-  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the implementation review report under the `## CI/CD Verification` section (see Implementation Review Report template). Proceed to the next step.
+  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to the next step.
 
-### 4e Update documentation and metadata
+### 5c Update documentation and metadata
 
 - [ ] **Update the spec file:** Change its `State:` field to `IMPLEMENTED` and add it to the spec index in `specs/README.md`.
 - [ ] **Handle referenced files:** If the spec lists files in its `References:` header, move those files to `specs/done-reports/` and update the reference paths in the spec accordingly.
 - [ ] **Run any additional project-specific finalize steps** as specified in the project's `CLAUDE.md` or `specs/CLAUDE.md`. This is the extension point where project-specific documentation updates, skill file updates, and custom push/CI commands are executed.
+- [ ] **Generate the implementation review report** — delegate to the `workreview` skill, which creates `specs/done-reports/{spec-basename}-review.md` and consolidates the `#### Implementation Log` section into it
 
 ---
 
@@ -243,88 +245,3 @@ When your implementation causes a pre-existing test to fail, you may fix it and 
 - Perform all manual testing to make sure the change does what it claims (human does this)
 - Mark the `State:` of the spec to `VALIDATED`
 - For chunked work, it is valid to move every completed chunk from `IMPLEMENTED` to `VALIDATED` in one later pass after the human verifies the integrated feature end-to-end. Do not require each chunk to be validated immediately after its implementation.
-
----
-
-## Multi-chunk plan workflow tiers
-
-When implementing a spec via a chunk plan, the workflow is split into tiers as documented in `references/taskcreator.md`
-
-**Initialize workflow** (runs before any chunks are implemented)
-- Run all unit tests before starting
-
-**Per-chunk workflow** (each chunk does these):
-
-**Finalize workflow** (runs once after all chunks complete):
-- Update CHANGELOG.md, README.md, and any other project documentation
-- **Generate the implementation review report** (see below)
-- Run any additional project-specific finalize steps (per project's CLAUDE.md)
-- Push and verify CI
-- **CI/CD gate: confirm the build is GREEN before marking the spec IMPLEMENTED** (see Workflow 4d)
-- Human validation may later move the completed chunks and/or parent spec from `IMPLEMENTED` to `VALIDATED` in a single follow-up pass
-
-Single-spec implementation (without a plan) continues to do everything in one pass as described above.
-
----
-
-## Implementation Review Report
-
-Every spec implementation — whether via chunk plan, single-pass, or follow-up bug fix — MUST produce a review report at finalize time.
-
-### File location and naming
-
-`specs/done-reports/{spec-basename}-review.md`
-
-Example: `specs/claim-domain-spec.md` → `specs/done-reports/claim-domain-spec-review.md`
-
-### Report template
-
-```markdown
-# Implementation Review: {spec title}
-
-**Spec:** `specs/{spec-file}.md`
-**Implemented:** {date}
-**Implementer:** {agent or human}
-
-## Existing Test Modifications
-
-| Test File | Change | Spec Backing | Rationale |
-|-----------|--------|--------------|-----------|
-
-If no existing tests were modified, write: "No existing tests were modified."
-
-## CI/CD Verification
-
-Record the CI/CD build status at finalize time. One of:
-- **Build GREEN:** `<build tool> status` confirmed SUCCESS (build #N, date)
-- **No CI/CD configured:** project does not have a buildgit skill installed or no build job is configured. Spec marked IMPLEMENTED without CI/CD verification.
-
-## Flagged Decisions
-
-Any entry above with Spec Backing = "None" must be repeated here with additional context about why the agent proceeded without spec backing. These are the items that most need reviewer attention.
-
-## Files Changed (alphabetical)
-
-- `path/to/modified-file.ext`
-
-List only project files that were modified (not created) by this implementation. Exclude temporary files, build artifacts, and generated output.
-
-## Files Created (alphabetical)
-
-- `path/to/new-file.ext`
-
-List only new project files added by this implementation. Exclude temporary files, build artifacts, and generated output.
-
-## Key Implementation Decisions
-
-- {notable design decisions, trade-offs, or deviations from the spec, one per bullet}
-
-## Consolidation
-
-If a chunk plan was used, summarize each chunk's Implementation Log entry here (one bullet per chunk). This provides a single-file view of the entire implementation.
-```
-
-### How the report is built
-
-- **During implementation:** Each time you modify an existing test, immediately append a row to a scratch log (the chunk's `#### Implementation Log` if using a chunk plan, or a temporary `## Implementation Review Notes` section at the bottom of the spec file if not). Do not defer this — log it when you make the change.
-- **At finalize time:** Consolidate all logged entries into the review report file. Remove any temporary scratch sections from the spec file.
