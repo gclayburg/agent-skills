@@ -187,7 +187,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 - [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
   1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
-  2. **If buildgit is available and a build job is configured:** Run `buildgit status` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
+  2. **If buildgit is available and a build job is configured:** Commit your changes and run `buildgit push` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
   3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to **Workflow 5 (Finalize)**.
 
 **Before finalize:** Workflow 5 includes a **mandatory** work review (§5c). You **must** read and run the `workreview` skill before setting `State:` to `IMPLEMENTED`. Skipping workreview is not allowed.

@@ -1,5 +1,5 @@
 # Parse status command options
-# Sets: STATUS_JSON_MODE, STATUS_FOLLOW_MODE, STATUS_ONCE_MODE, STATUS_LINE_MODE, STATUS_LINE_COUNT, STATUS_ALL_MODE, STATUS_NO_TESTS, STATUS_PROBE_ALL
+# Sets: STATUS_JSON_MODE, STATUS_FOLLOW_MODE, STATUS_ONCE_MODE, STATUS_LINE_MODE, STATUS_LINE_COUNT, STATUS_ALL_MODE, STATUS_NO_TESTS, STATUS_PROBE_ALL, STATUS_REVERSE, STATUS_GITLOG, STATUS_GITLOG_RANGE
 _parse_status_options() {
     STATUS_JSON_MODE=false
     STATUS_FOLLOW_MODE=false
@@ -18,6 +18,9 @@ _parse_status_options() {
     STATUS_CONSOLE_TEXT_STAGE=""
     STATUS_LIST_STAGES_MODE=false
     STATUS_PROBE_ALL=false
+    STATUS_REVERSE=false
+    STATUS_GITLOG=false
+    STATUS_GITLOG_RANGE=""
     _LINE_FORMAT_STRING="$_DEFAULT_LINE_FORMAT"
 
     while [[ $# -gt 0 ]]; do
@@ -80,6 +83,19 @@ _parse_status_options() {
                 ;;
             -a|--all)
                 STATUS_ALL_MODE=true
+                shift
+                ;;
+            -r|--reverse)
+                STATUS_REVERSE=true
+                shift
+                ;;
+            -g|--gitlog)
+                STATUS_GITLOG=true
+                shift
+                ;;
+            --gitlog=*)
+                STATUS_GITLOG=true
+                STATUS_GITLOG_RANGE="${1#--gitlog=}"
                 shift
                 ;;
             --console-text)

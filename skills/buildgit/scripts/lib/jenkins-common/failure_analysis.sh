@@ -50,8 +50,9 @@ _downstream_stage_job_match_score() {
     job_lc=$(echo "$job_name" | tr '[:upper:]' '[:lower:]')
 
     # Split job name into segments for word-level matching
+    # Use -, /, and _ as delimiters so "phandlemono" stays one segment
     local job_segments
-    job_segments=$(echo "$job_lc" | tr '-' ' ')
+    job_segments=$(echo "$job_lc" | sed 's/[-/_]/ /g')
 
     local score=0
     local token

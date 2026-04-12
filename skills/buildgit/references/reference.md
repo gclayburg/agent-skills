@@ -359,13 +359,27 @@ $ buildgit status -2
 
 ```bash
 $ buildgit status -n 3
-# Prints 3 full build reports, oldest first
+# Prints 3 full build reports, newest first (use -r/--reverse for oldest first)
 
 $ buildgit status -n 3 --json
-{"job":"phandlemono-IT","build":{"number":36,...}}
-{"job":"phandlemono-IT","build":{"number":37,...}}
 {"job":"phandlemono-IT","build":{"number":38,...}}
+{"job":"phandlemono-IT","build":{"number":37,...}}
+{"job":"phandlemono-IT","build":{"number":36,...}}
 ```
+
+## Interleave git log commits with build status (`--gitlog`)
+
+```bash
+$ buildgit status --line --gitlog
+SUCCESS     #96 id=287b13d Tests=928/0/6 Took 3m 6s on 2026-03-26T18:20:49-0600 (14 days ago)
+                   0dc12dd (HEAD -> main) specmgr skill update for chunkplan
+SUCCESS     #95 id=5340c5d Tests=928/0/6 Took 2m 50s on 2026-03-26T14:27:32-0600 (14 days ago)
+                   4b8988f shorten filenames
+ABORTED     #94 id=5340c5d Tests=727/0/6 Took 15m 7s on 2026-03-26T13:30:38-0600 (14 days ago)
+                   2d02855 update specmgr and claude cli filter for implement-spec.sh
+```
+
+`--gitlog` (short `-g`) interleaves `git log --oneline` commit rows beneath the build that produced each commit. With no explicit range, the revision range is `<default-branch>..HEAD`, where the default branch is taken from `refs/remotes/origin/HEAD` when it resolves, otherwise `main`, otherwise `master`, otherwise `HEAD~20..HEAD` with a one-time stderr warning. Pass an explicit range with `--gitlog=<range>` (e.g. `--gitlog=origin/feature..HEAD`, `--gitlog=HEAD~10..HEAD`). When the format string contains `%c`, indented commit rows align under the short SHA in the `id=` field (computed per build row); otherwise a fixed 5-space indent is used. Without `-n`, every build for the current branch is fetched up to `BUILDGIT_GITLOG_MAX_BUILDS` (default 50). `--gitlog` is incompatible with `--all`, `--json`, `-r`, and `-f`.
 
 ## Show last N builds then follow (--line -f)
 

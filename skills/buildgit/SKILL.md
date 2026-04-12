@@ -73,10 +73,13 @@ Invoke commands from the skill directory, or use the full path to `scripts/build
 | `scripts/buildgit status` | Jenkins build status snapshot |
 | `scripts/buildgit status <build#>` | Status of one build (`31`, `0`, `-1`, `-2`) |
 | `scripts/buildgit status --line` | One-line status for latest build |
-| `scripts/buildgit status -n <N> --line` | One-line status for latest N builds (oldest first) |
+| `scripts/buildgit status -n <N> --line` | One-line status for latest N builds (newest first) |
+| `scripts/buildgit status -n <N> --line -r` | One-line status for latest N builds (oldest first; restores prior default) |
+| `scripts/buildgit status --line --gitlog` | Interleave git log commit rows beneath their build (default range `<default-branch>..HEAD` from `origin/HEAD` / `main` / `master` / `HEAD~20` fallback) |
+| `scripts/buildgit status --line --gitlog=<range>` | Interleave commits from an explicit `git log` range (e.g. `HEAD~10..HEAD`) |
 | `scripts/buildgit status --prior-jobs <N>` | Snapshot with N prior one-line builds before target build |
-| `scripts/buildgit status -n <N>` | Full snapshot output for latest N builds (oldest first) |
-| `scripts/buildgit status -n <N> --json` | JSONL snapshot output for latest N builds |
+| `scripts/buildgit status -n <N>` | Full snapshot output for latest N builds (newest first) |
+| `scripts/buildgit status -n <N> --json` | JSONL snapshot output for latest N builds (newest first) |
 | `scripts/buildgit status -n <N> --no-tests` | One-line status while skipping test-report API calls |
 | `scripts/buildgit status --format '<fmt>'` | One-line status with custom format string (implies --line) |
 | `scripts/buildgit status --all` | Force full snapshot output |

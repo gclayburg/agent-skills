@@ -54,10 +54,10 @@ Global Options:
   --version                      Show version number and exit
 
 Commands:
-  status [build#] [-f|--follow] [--once[=N]] [--probe-all] [-n <count>] [--json] [--line] [--all] [--no-tests] [--format <fmt>] [--prior-jobs <N>] [--console-text [stage]] [--list-stages]
+  status [build#] [-f|--follow] [--once[=N]] [--probe-all] [-n <count>] [-r|--reverse] [-g|--gitlog[=<range>]] [--json] [--line] [--all] [--no-tests] [--format <fmt>] [--prior-jobs <N>] [--console-text [stage]] [--list-stages]
                       Display Jenkins build status (latest or specific build)
                       build# can be absolute (31) or relative (0=latest, -1=previous, -2=two ago)
-                      Default: one-line output (TTY adds color)
+                      Default: one-line output (TTY adds color), newest build first
   agents [--json] [--label <name>] [--nodes]
                       Show Jenkins executor capacity by label
   timing [build#] [--json] [--tests] [--by-stage] [--compare <a> <b>] [-n <count>]
@@ -78,7 +78,11 @@ Snapshot status of completed Jenkins build jobs:
   buildgit status 31               # Status of build #31
   buildgit status --json           # JSON format for Jenkins status
   buildgit status --line           # One-line status with test results
-  buildgit status -n 5 --line      # Last 5 builds, oldest first, one line each
+  buildgit status -n 5 --line      # Last 5 builds, newest first, one line each
+  buildgit status -n 5 --line -r   # Last 5 builds, oldest first
+  buildgit status --line --gitlog  # All branch builds + git log (default: commits since repo default branch..HEAD)
+  buildgit status -n 5 --line -g   # Last 5 builds + all commits in range
+  buildgit status --line --gitlog=main..HEAD  # Custom git range
   buildgit status -n 10 --no-tests # Last 10 builds, skip test fetch
   buildgit status --prior-jobs 5   # Latest build + 5 prior one-line builds
   buildgit status --prior-jobs 5 201  # Build #201 + 5 prior one-line builds
@@ -800,6 +804,19 @@ cmd_status() {
         _usage_error "cannot combine --format with --all"
     fi
 
+    # Validate -g/--gitlog combinations (run before generic --line/--json checks)
+    if [[ "${STATUS_GITLOG:-false}" == "true" ]]; then
+        if [[ "$STATUS_ALL_MODE" == "true" ]]; then
+            _usage_error "Cannot use --gitlog with --all"
+        fi
+        if [[ "$STATUS_JSON_MODE" == "true" ]]; then
+            _usage_error "Cannot use --gitlog with --json"
+        fi
+        if [[ "$STATUS_FOLLOW_MODE" == "true" ]]; then
+            _usage_error "Cannot use --gitlog with --follow"
+        fi
+    fi
+
     # Validate incompatible option combinations for --line mode
     if [[ "$STATUS_LINE_MODE" == "true" && "$STATUS_ALL_MODE" == "true" ]]; then
         _usage_error "Cannot use --line with --all"
@@ -823,6 +840,14 @@ cmd_status() {
     # Validate incompatible options: follow + build number
     if [[ "$STATUS_FOLLOW_MODE" == "true" && -n "$STATUS_BUILD_NUMBER" ]]; then
         _usage_error "Cannot use --follow with a specific build number"
+    fi
+
+    # Validate -r/--reverse combinations
+    if [[ "${STATUS_REVERSE:-false}" == "true" && "$STATUS_FOLLOW_MODE" == "true" ]]; then
+        _usage_error "Cannot use -r/--reverse with --follow"
+    fi
+    if [[ "${STATUS_REVERSE:-false}" == "true" && "${STATUS_GITLOG:-false}" == "true" ]]; then
+        _usage_error "Cannot use -r/--reverse with --gitlog"
     fi
     if [[ "$STATUS_CONSOLE_TEXT_MODE" == "true" || "$STATUS_LIST_STAGES_MODE" == "true" ]]; then
         if [[ "$STATUS_CONSOLE_TEXT_MODE" == "true" && "$STATUS_LIST_STAGES_MODE" == "true" ]]; then
@@ -904,7 +929,7 @@ cmd_status() {
     # JSON mode always uses structured output path
     if [[ "$STATUS_JSON_MODE" == "true" ]]; then
         if [[ "${STATUS_N_SET:-false}" == "true" ]]; then
-            _status_multi_build_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$STATUS_LINE_COUNT" "true"
+            _status_multi_build_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$STATUS_LINE_COUNT" "true" "0" "$STATUS_NO_TESTS" "$STATUS_REVERSE"
             return $?
         fi
         _jenkins_status_check "$_VALIDATED_JOB_NAME" "$STATUS_JSON_MODE" "$resolved_status_build_number"
@@ -923,13 +948,22 @@ cmd_status() {
         use_line_mode=true
     fi
 
+    # --gitlog branches into the interleave helper (line mode only).
+    if [[ "${STATUS_GITLOG:-false}" == "true" ]]; then
+        if [[ "$STATUS_ALL_MODE" == "true" ]]; then
+            _usage_error "Cannot use --gitlog with --all"
+        fi
+        _status_gitlog_interleave "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$line_count" "$STATUS_NO_TESTS" "${STATUS_N_SET:-false}" "$STATUS_GITLOG_RANGE"
+        return $?
+    fi
+
     if [[ "$use_line_mode" == "true" ]]; then
-        _status_line_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$line_count" "$STATUS_NO_TESTS" "$STATUS_PRIOR_JOBS"
+        _status_line_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$line_count" "$STATUS_NO_TESTS" "$STATUS_PRIOR_JOBS" "$STATUS_REVERSE"
         return $?
     fi
 
     if [[ "${STATUS_N_SET:-false}" == "true" ]]; then
-        _status_multi_build_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$line_count" "false" "$STATUS_PRIOR_JOBS" "$STATUS_NO_TESTS"
+        _status_multi_build_check "$_VALIDATED_JOB_NAME" "$resolved_status_build_number" "$line_count" "false" "$STATUS_PRIOR_JOBS" "$STATUS_NO_TESTS" "$STATUS_REVERSE"
         return $?
     fi
 
