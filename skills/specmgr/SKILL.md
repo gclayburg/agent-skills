@@ -197,9 +197,12 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 
 **Triggers:** "implement DRAFT spec with chunk plan ...", "implement chunk X from chunk plan..."
 
+> **Note:** Even when asked to implement only "one chunk," if that chunk turns out to be the final incomplete chunk, Workflow 5 (Finalize) is mandatory immediately after 4b completes. Do not wait for a separate user instruction to finalize.
+
 ### 4a Before writing code
 - [ ] **Check for chunk plan** if there is no chunk plan, use Workflow 3 instead of this one
-- [ ] **Run all unit tests** and confirm they pass. Do not proceed if tests are failing. If the test commands themselves are broken (e.g. missing tools, build infrastructure failures, repository configuration errors), do NOT skip tests and continue — this is a blocking failure. Output `RALPH_BLOCKED=<reason>` as the final line and stop.
+- [ ] **Run all unit tests NOW, before writing any code**, and confirm they pass. This establishes the baseline. Do not proceed if tests are failing. If the test commands themselves are broken (e.g. missing tools, build infrastructure failures, repository configuration errors), do NOT skip tests and continue — this is a blocking failure. Output `RALPH_BLOCKED=<reason>` as the final line and stop.
+- [ ] **Note the spec's `AgentTestPlan:` header field.** If it is non-empty, you will execute that test plan during Workflow 5a. Record the path now so it is not forgotten when you reach finalization.
 
 ### 4b Per-Chunk Workflow (every chunk must follow these steps)
 
@@ -211,6 +214,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ]  **Mark chunk complete** Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
 - [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
 - [ ]  **Fix build errors** Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary.
+- [ ]  **Check if this was the last chunk.** Scan the Contents table in the chunk plan. If every chunk row is now `[x]`, proceed immediately to Workflow 5 (Finalize) without waiting for further user instruction. Finalization is a mandatory part of the implementation — it is not a separate user request.
 
 **Blocking failure rule:** If at any point during the per-chunk workflow you encounter a failure that you cannot fix (broken build infrastructure, missing tools, repository configuration errors, or test failures unrelated to your chunk's changes), do NOT output `REMAINING_CHUNKS=n`. Instead, output `RALPH_BLOCKED=<brief reason>` as the final line and stop immediately. Do not attempt the next chunk. If a chunk is abandoned due to `RALPH_BLOCKED`, still record the compaction count and skills used up to the blocking point in the chunk's Implementation Log before stopping.
 
