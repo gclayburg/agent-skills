@@ -526,15 +526,25 @@ _map_stages_to_downstream() {
     local console_output="$1"
     local stages_json="$2"
 
-    local result="{}"
-    local claimed_positive_downstreams="{}"
-    local stage_count
-    stage_count=$(echo "$stages_json" | jq 'length' 2>/dev/null) || stage_count=0
+    # Perf: pull every stage name out of stages_json in one jq pass; the loop
+    # body only forks jq when a downstream is actually matched (rare — ~N_ds
+    # forks total, where N_ds is the number of component builds).
+    local -a _map_stage_names=()
+    local _map_name
+    while IFS= read -r _map_name; do
+        [[ -z "$_map_name" ]] && continue
+        _map_stage_names+=("$_map_name")
+    done < <(echo "$stages_json" | jq -r '.[]?.name // empty' 2>/dev/null)
+
+    local stage_count=${#_map_stage_names[@]}
+    # Accumulate matches into parallel arrays; emit one jq fork at the end.
+    local -a _map_out_stages=() _map_out_jobs=() _map_out_builds=()
+    # Track downstream keys already claimed by a positive-score match.
+    local -a _map_claimed_keys=()
 
     local i=0
     while [[ $i -lt $stage_count ]]; do
-        local stage_name
-        stage_name=$(echo "$stages_json" | jq -r ".[$i].name")
+        local stage_name="${_map_stage_names[$i]}"
 
         # Extract this stage's console logs
         local stage_logs
@@ -557,20 +567,28 @@ _map_stages_to_downstream() {
                     local downstream_key selected_score already_claimed_by_positive
                     downstream_key="${ds_job}#${ds_build}"
                     selected_score=$(_downstream_stage_job_match_score "$stage_name" "$ds_job")
-                    already_claimed_by_positive=$(echo "$claimed_positive_downstreams" | jq -r --arg key "$downstream_key" '.[$key] // false' 2>/dev/null)
+
+                    already_claimed_by_positive="false"
+                    if [[ ${#_map_claimed_keys[@]} -gt 0 ]]; then
+                        local _ck
+                        for _ck in "${_map_claimed_keys[@]}"; do
+                            if [[ "$_ck" == "$downstream_key" ]]; then
+                                already_claimed_by_positive="true"
+                                break
+                            fi
+                        done
+                    fi
+
                     if [[ "$selected_score" -le 0 && "$already_claimed_by_positive" == "true" ]]; then
                         i=$((i + 1))
                         continue
                     fi
-                    result=$(echo "$result" | jq \
-                        --arg stage "$stage_name" \
-                        --arg job "$ds_job" \
-                        --argjson build "$ds_build" \
-                        '. + {($stage): {"job": $job, "build": $build}}')
+
+                    _map_out_stages+=("$stage_name")
+                    _map_out_jobs+=("$ds_job")
+                    _map_out_builds+=("$ds_build")
                     if [[ "$selected_score" -gt 0 ]]; then
-                        claimed_positive_downstreams=$(echo "$claimed_positive_downstreams" | jq \
-                            --arg key "$downstream_key" \
-                            '. + {($key): true}')
+                        _map_claimed_keys+=("$downstream_key")
                     fi
                 fi
             fi
@@ -579,7 +597,26 @@ _map_stages_to_downstream() {
         i=$((i + 1))
     done
 
-    echo "$result"
+    local match_count=${#_map_out_stages[@]}
+    if [[ $match_count -eq 0 ]]; then
+        echo "{}"
+        return 0
+    fi
+
+    # Build the result map in a single jq call.
+    local tsv_input="" j=0
+    while [[ $j -lt $match_count ]]; do
+        tsv_input+="${_map_out_stages[$j]}"$'\x1f'"${_map_out_jobs[$j]}"$'\x1f'"${_map_out_builds[$j]}"$'\n'
+        j=$((j + 1))
+    done
+    printf '%s' "$tsv_input" | jq -Rsc '
+        [ split("\n")
+          | map(select(length > 0))
+          | map(split(""))
+          | .[]
+          | {(.[0]): {job: .[1], build: (.[2] | tonumber)}}
+        ] | add // {}
+    '
 }
 
 _detect_branch_substages_from_blue_ocean() {
@@ -708,18 +745,37 @@ _get_nested_stages() {
     local nesting_depth="${4:-0}"
     local parent_stage_name="${5:-}"
     local inherited_parallel_path="${6:-}"
+    local parallel_max="${BUILDGIT_PARALLEL_MAX:-8}"
+    if ! [[ "$parallel_max" =~ ^[1-9][0-9]*$ ]]; then
+        parallel_max=8
+    fi
+
+    local pfetch_dir
+    pfetch_dir=$(mktemp -d "${TMPDIR:-/tmp}/buildgit-pfetch.XXXXXX")
+
+    get_all_stages "$job_name" "$build_number" > "${pfetch_dir}/stages" 2>/dev/null 3>&- &
+    local p1=$!
+    get_console_output_cached "$job_name" "$build_number" > "${pfetch_dir}/console" 2>/dev/null 3>&- &
+    local p2=$!
+    get_blue_ocean_nodes "$job_name" "$build_number" > "${pfetch_dir}/blue" 2>/dev/null 3>&- &
+    local p3=$!
+
+    wait "$p1" "$p2" "$p3" 2>/dev/null || true
 
     local stages_json
-    stages_json=$(get_all_stages "$job_name" "$build_number")
+    stages_json=$(cat "${pfetch_dir}/stages" 2>/dev/null)
+    local console_output
+    console_output=$(cat "${pfetch_dir}/console" 2>/dev/null)
+    local blue_nodes_json
+    blue_nodes_json=$(cat "${pfetch_dir}/blue" 2>/dev/null)
+    rm -rf "$pfetch_dir"
+
+    [[ -z "$stages_json" || "$stages_json" == "null" ]] && stages_json="[]"
+    [[ -z "$blue_nodes_json" || "$blue_nodes_json" == "null" ]] && blue_nodes_json="[]"
     if [[ -z "$stages_json" || "$stages_json" == "[]" ]]; then
         echo "[]"
         return 0
     fi
-
-    local console_output
-    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
-    local blue_nodes_json
-    blue_nodes_json=$(get_blue_ocean_nodes "$job_name" "$build_number" 2>/dev/null) || blue_nodes_json="[]"
 
     local stage_agent_map="{}"
     local pipeline_scope_agent=""
@@ -737,12 +793,24 @@ _get_nested_stages() {
     local _wrapper_last_branch_index="{}"
     local _branch_aggregate_duration="{}"
     if [[ -n "$console_output" ]]; then
-        local stage_count_for_parallel
-        stage_count_for_parallel=$(echo "$stages_json" | jq 'length')
+        # Perf: pre-extract stage names once, and collect per-wrapper branch/
+        # substage data into bash parallel arrays. A single jq pass at the end
+        # builds all six maps in one shot, replacing O(wrappers × branches × 7)
+        # jq forks in the legacy per-branch loop.
+        local -a _ns_names=()
+        local _ns_n
+        while IFS= read -r _ns_n; do
+            [[ -z "$_ns_n" ]] && continue
+            _ns_names+=("$_ns_n")
+        done < <(echo "$stages_json" | jq -r '.[]?.name // empty' 2>/dev/null)
+
+        local stage_count_for_parallel=${#_ns_names[@]}
+        local _pw_fsep=$'\x1f'  # Unit Separator — between fields within a record
+        local _pw_rsep=$'\x1e'  # Record Separator — between records
+        local _pw_input=""
         local pi=0
         while [[ $pi -lt $stage_count_for_parallel ]]; do
-            local pi_stage_name
-            pi_stage_name=$(echo "$stages_json" | jq -r ".[$pi].name")
+            local pi_stage_name="${_ns_names[$pi]}"
             local branches
             branches=$(_detect_parallel_branches "$console_output" "$pi_stage_name")
             if [[ -n "$branches" && "$branches" != "[]" ]]; then
@@ -755,72 +823,85 @@ _get_nested_stages() {
                         branch_substages="$blue_branch_substages"
                     fi
                 fi
-                parallel_info=$(echo "$parallel_info" | jq \
-                    --arg s "$pi_stage_name" \
-                    --argjson b "$branches" \
-                    '. + {($s): {"branches": $b}}')
-
-                local branch_index=1
-                local max_branch_idx=-1
-                local branch_name
-                while IFS= read -r branch_name; do
-                    [[ -z "$branch_name" ]] && continue
-                    _branch_to_wrapper=$(echo "$_branch_to_wrapper" | jq \
-                        --arg b "$branch_name" --arg w "$pi_stage_name" '. + {($b): $w}')
-                    if [[ "$blue_nodes_json" != "[]" ]]; then
-                        local branch_blue_node_id
-                        branch_blue_node_id=$(echo "$blue_nodes_json" | jq -r \
-                            --arg wrapper "$pi_stage_name" \
-                            --arg branch "$branch_name" \
-                            --argjson stages "$stages_json" '
-                                ($stages | map(select(.name == $wrapper)) | first | .id // "") as $wrapper_id
-                                | if $wrapper_id == "" then
-                                    ""
-                                  else
-                                    [.[] | select(.type == "PARALLEL" and .firstParent == ($wrapper_id | tostring) and .name == $branch)][0].id // ""
-                                  end
-                            ')
-                        if [[ -n "$branch_blue_node_id" ]]; then
-                            _branch_to_blue_node_id=$(echo "$_branch_to_blue_node_id" | jq \
-                                --arg b "$branch_name" \
-                                --arg id "$branch_blue_node_id" \
-                                '. + {($b): $id}')
-                        fi
-                    fi
-                    local branch_path="$branch_index"
-                    if [[ -n "$inherited_parallel_path" ]]; then
-                        branch_path="${inherited_parallel_path}.${branch_index}"
-                    fi
-                    _branch_to_path=$(echo "$_branch_to_path" | jq \
-                        --arg b "$branch_name" --arg p "$branch_path" '. + {($b): $p}')
-                    local branch_local_substages
-                    branch_local_substages=$(echo "${branch_substages:-{}}" | jq --arg b "$branch_name" '.[$b] // []')
-                    _branch_to_local_substages=$(echo "$_branch_to_local_substages" | jq \
-                        --arg b "$branch_name" \
-                        --argjson substages "$branch_local_substages" \
-                        '. + {($b): $substages}')
-                    while IFS= read -r substage_name; do
-                        [[ -z "$substage_name" ]] && continue
-                        _substage_to_branch=$(echo "$_substage_to_branch" | jq \
-                            --arg s "$substage_name" \
-                            --arg b "$branch_name" \
-                            '. + {($s): $b}')
-                    done <<< "$(echo "$branch_local_substages" | jq -r '.[]')"
-
-                    local branch_pos
-                    branch_pos=$(echo "$stages_json" | jq -r --arg n "$branch_name" 'to_entries[] | select(.value.name == $n) | .key' | head -1)
-                    if [[ "$branch_pos" =~ ^[0-9]+$ && "$branch_pos" -gt "$max_branch_idx" ]]; then
-                        max_branch_idx="$branch_pos"
-                    fi
-                    branch_index=$((branch_index + 1))
-                done <<< "$(echo "$branches" | jq -r '.[]')"
-                if [[ "$max_branch_idx" -ge 0 ]]; then
-                    _wrapper_last_branch_index=$(echo "$_wrapper_last_branch_index" | jq \
-                        --arg w "$pi_stage_name" --argjson idx "$max_branch_idx" '. + {($w): $idx}')
-                fi
+                [[ -z "$branch_substages" ]] && branch_substages="{}"
+                # Append (wrapper, branches_json, substages_json) separated by
+                # \x1f within a record and \x1e between records — both are
+                # non-whitespace control chars that can't appear in valid JSON
+                # content, so they won't collide with the embedded JSON values.
+                _pw_input+="${pi_stage_name}${_pw_fsep}${branches}${_pw_fsep}${branch_substages}${_pw_rsep}"
             fi
             pi=$((pi + 1))
         done
+
+        if [[ -n "$_pw_input" ]]; then
+            local _parallel_maps
+            _parallel_maps=$(printf '%s' "$_pw_input" | jq -Rsc \
+                --arg fsep "$_pw_fsep" \
+                --arg rsep "$_pw_rsep" \
+                --arg prefix "$inherited_parallel_path" \
+                --argjson stages "$stages_json" \
+                --argjson blue "$blue_nodes_json" '
+                ($stages | to_entries | map({(.value.name): .key}) | add // {}) as $name_to_idx
+                | ($stages | map({(.name): (.id // "")}) | add // {}) as $name_to_id
+                | ($blue // []) as $blue_nodes
+                | [ split($rsep) | .[] | select(length > 0) | split($fsep)
+                    | { wrapper: .[0],
+                        branches: (.[1] | fromjson),
+                        substages: (.[2] | fromjson) } ]
+                  as $items
+                | reduce $items[] as $it (
+                    { parallel_info: {},
+                      branch_to_wrapper: {},
+                      branch_to_path: {},
+                      branch_to_local_substages: {},
+                      substage_to_branch: {},
+                      branch_to_blue_node_id: {},
+                      wrapper_last_branch_index: {} };
+                    . as $acc
+                    | $it.wrapper as $w
+                    | ($it.branches // []) as $brs
+                    | ($it.substages // {}) as $subs
+                    | ($name_to_id[$w] // "") as $wrapper_id
+                    | $acc
+                    | .parallel_info = (.parallel_info + { ($w): { branches: $brs } })
+                    | reduce ($brs | to_entries[]) as $be (
+                        .;
+                        $be.value as $bname
+                        | ($be.key + 1) as $branch_index
+                        | (if $prefix == "" then ($branch_index | tostring)
+                           else ($prefix + "." + ($branch_index | tostring)) end) as $bpath
+                        | ($subs[$bname] // []) as $bsubs
+                        | .branch_to_wrapper = (.branch_to_wrapper + { ($bname): $w })
+                        | .branch_to_path = (.branch_to_path + { ($bname): $bpath })
+                        | .branch_to_local_substages = (.branch_to_local_substages + { ($bname): $bsubs })
+                        | reduce $bsubs[] as $ss (
+                            .;
+                            .substage_to_branch = (.substage_to_branch + { ($ss): $bname })
+                          )
+                        | (if $wrapper_id != "" then
+                             ([ $blue_nodes[]
+                                | select(.type == "PARALLEL"
+                                         and .firstParent == ($wrapper_id | tostring)
+                                         and .name == $bname) ][0].id // "")
+                           else "" end) as $bnode_id
+                        | (if $bnode_id != ""
+                           then .branch_to_blue_node_id = (.branch_to_blue_node_id + { ($bname): $bnode_id })
+                           else . end)
+                      )
+                    | ([ $brs[] | ($name_to_idx[.] // -1) | select(. >= 0) ] | max // -1) as $max_idx
+                    | (if $max_idx >= 0
+                       then .wrapper_last_branch_index = (.wrapper_last_branch_index + { ($w): $max_idx })
+                       else . end)
+                )
+            ')
+            parallel_info=$(echo "$_parallel_maps" | jq -c '.parallel_info')
+            _branch_to_wrapper=$(echo "$_parallel_maps" | jq -c '.branch_to_wrapper')
+            _branch_to_path=$(echo "$_parallel_maps" | jq -c '.branch_to_path')
+            _branch_to_local_substages=$(echo "$_parallel_maps" | jq -c '.branch_to_local_substages')
+            _substage_to_branch=$(echo "$_parallel_maps" | jq -c '.substage_to_branch')
+            _branch_to_blue_node_id=$(echo "$_parallel_maps" | jq -c '.branch_to_blue_node_id')
+            _wrapper_last_branch_index=$(echo "$_parallel_maps" | jq -c '.wrapper_last_branch_index')
+        fi
     fi
 
     local branch_name
@@ -863,17 +944,144 @@ _get_nested_stages() {
         stage_downstream_map=$(_map_stages_to_downstream "$console_output" "$filtered_stages_json")
     fi
 
-    local result="[]"
-    local deferred_wrappers="{}"
     local stage_count
     stage_count=$(echo "$stages_json" | jq 'length')
+
+    # Perf: pre-extract per-stage fields in a single jq pass so the collect and
+    # main loops can index bash arrays instead of forking jq per stage per loop.
+    local -a _gs_names=() _gs_status=() _gs_duration=()
+    local _gs_n _gs_s _gs_d
+    while IFS=$'\t' read -r _gs_n _gs_s _gs_d; do
+        _gs_names+=("$_gs_n")
+        _gs_status+=("$_gs_s")
+        _gs_duration+=("$_gs_d")
+    done < <(echo "$stages_json" | jq -r '.[]? | [.name, .status, (.durationMillis|tostring)] | @tsv' 2>/dev/null)
+
+    local -a recursive_job_names
+    local -a recursive_build_numbers
+    local -a recursive_prefixes
+    local -a recursive_parent_names
+    local -a recursive_parallel_paths
+    local -a recursive_output_files
+    local recursive_task_count=0
+
+    if [[ "$stage_downstream_map" != "{}" ]]; then
+        local collect_i=0
+        while [[ $collect_i -lt $stage_count ]]; do
+            local collect_stage_name
+            collect_stage_name="${_gs_names[$collect_i]}"
+
+            local collect_local_parent_branch
+            collect_local_parent_branch=$(echo "$_substage_to_branch" | jq -r --arg s "$collect_stage_name" '.[$s] // empty')
+            if [[ -n "$collect_local_parent_branch" && "$collect_local_parent_branch" != "null" ]]; then
+                collect_i=$((collect_i + 1))
+                continue
+            fi
+
+            local collect_parallel_branch=""
+            local collect_stage_parallel_path="$inherited_parallel_path"
+            local collect_bw_check
+            collect_bw_check=$(echo "$_branch_to_wrapper" | jq -r --arg b "$collect_stage_name" '.[$b] // empty')
+            if [[ -n "$collect_bw_check" && "$collect_bw_check" != "null" ]]; then
+                collect_parallel_branch="$collect_stage_name"
+                collect_stage_parallel_path=$(echo "$_branch_to_path" | jq -r --arg b "$collect_stage_name" '.[$b] // empty')
+            fi
+
+            local collect_display_name
+            if [[ -n "$prefix" ]]; then
+                collect_display_name="${prefix}->${collect_stage_name}"
+            else
+                collect_display_name="${collect_stage_name}"
+            fi
+
+            local collect_branch_local_substages_json="[]"
+            if [[ -n "$collect_parallel_branch" ]]; then
+                collect_branch_local_substages_json=$(echo "$_branch_to_local_substages" | jq --arg b "$collect_stage_name" '.[$b] // []')
+            fi
+
+            if [[ "$collect_branch_local_substages_json" != "[]" ]]; then
+                local collect_local_substage_name
+                while IFS= read -r collect_local_substage_name; do
+                    [[ -z "$collect_local_substage_name" ]] && continue
+                    local collect_local_substage_display_name collect_local_substage_ds_info
+                    collect_local_substage_display_name="${collect_display_name}->${collect_local_substage_name}"
+                    collect_local_substage_ds_info=$(echo "$stage_downstream_map" | jq -r --arg s "$collect_local_substage_name" '.[$s] // empty')
+                    if [[ -n "$collect_local_substage_ds_info" && "$collect_local_substage_ds_info" != "null" ]]; then
+                        recursive_job_names[$recursive_task_count]=$(echo "$collect_local_substage_ds_info" | jq -r '.job')
+                        recursive_build_numbers[$recursive_task_count]=$(echo "$collect_local_substage_ds_info" | jq -r '.build')
+                        recursive_prefixes[$recursive_task_count]="$collect_local_substage_display_name"
+                        recursive_parent_names[$recursive_task_count]="$collect_local_substage_name"
+                        recursive_parallel_paths[$recursive_task_count]="$collect_stage_parallel_path"
+                        recursive_task_count=$((recursive_task_count + 1))
+                    fi
+                done <<< "$(echo "$collect_branch_local_substages_json" | jq -r '.[]')"
+            fi
+
+            local collect_ds_info
+            collect_ds_info=$(echo "$stage_downstream_map" | jq -r --arg s "$collect_stage_name" '.[$s] // empty')
+            if [[ -n "$collect_ds_info" && "$collect_ds_info" != "null" ]]; then
+                recursive_job_names[$recursive_task_count]=$(echo "$collect_ds_info" | jq -r '.job')
+                recursive_build_numbers[$recursive_task_count]=$(echo "$collect_ds_info" | jq -r '.build')
+                recursive_prefixes[$recursive_task_count]="$collect_display_name"
+                recursive_parent_names[$recursive_task_count]="$collect_stage_name"
+                recursive_parallel_paths[$recursive_task_count]="$collect_stage_parallel_path"
+                recursive_task_count=$((recursive_task_count + 1))
+            fi
+
+            collect_i=$((collect_i + 1))
+        done
+    fi
+
+    local recursive_dir=""
+    if [[ $recursive_task_count -gt 0 ]]; then
+        recursive_dir=$(mktemp -d "${TMPDIR:-/tmp}/buildgit-nested.XXXXXX")
+        local batch_start=0
+        while [[ $batch_start -lt $recursive_task_count ]]; do
+            local batch_end=$((batch_start + parallel_max))
+            if [[ $batch_end -gt $recursive_task_count ]]; then
+                batch_end=$recursive_task_count
+            fi
+
+            local -a batch_pids
+            local batch_pid_count=0
+            local task_idx=$batch_start
+            while [[ $task_idx -lt $batch_end ]]; do
+                recursive_output_files[$task_idx]="${recursive_dir}/${task_idx}.json"
+                (
+                    _get_nested_stages \
+                        "${recursive_job_names[$task_idx]}" \
+                        "${recursive_build_numbers[$task_idx]}" \
+                        "${recursive_prefixes[$task_idx]}" \
+                        "$((nesting_depth + 1))" \
+                        "${recursive_parent_names[$task_idx]}" \
+                        "${recursive_parallel_paths[$task_idx]}" \
+                        > "${recursive_output_files[$task_idx]}" 2>/dev/null 3>&-
+                ) &
+                batch_pids[$batch_pid_count]=$!
+                batch_pid_count=$((batch_pid_count + 1))
+                task_idx=$((task_idx + 1))
+            done
+
+            local pid_idx=0
+            while [[ $pid_idx -lt $batch_pid_count ]]; do
+                wait "${batch_pids[$pid_idx]}" 2>/dev/null || true
+                pid_idx=$((pid_idx + 1))
+            done
+
+            batch_start=$batch_end
+        done
+    fi
+
+    local result="[]"
+    local deferred_wrappers="{}"
+    local recursive_result_idx=0
 
     local i=0
     while [[ $i -lt $stage_count ]]; do
         local stage_name status duration_ms
-        stage_name=$(echo "$stages_json" | jq -r ".[$i].name")
-        status=$(echo "$stages_json" | jq -r ".[$i].status")
-        duration_ms=$(echo "$stages_json" | jq -r ".[$i].durationMillis")
+        stage_name="${_gs_names[$i]}"
+        status="${_gs_status[$i]}"
+        duration_ms="${_gs_duration[$i]}"
 
         local local_parent_branch
         local_parent_branch=$(echo "$_substage_to_branch" | jq -r --arg s "$stage_name" '.[$s] // empty')
@@ -975,10 +1183,13 @@ _get_nested_stages() {
                 local local_substage_ds_info
                 local_substage_ds_info=$(echo "$stage_downstream_map" | jq -r --arg s "$local_substage_name" '.[$s] // empty')
                 if [[ -n "$local_substage_ds_info" && "$local_substage_ds_info" != "null" ]]; then
-                    local ds_job ds_build nested_stages
-                    ds_job=$(echo "$local_substage_ds_info" | jq -r '.job')
-                    ds_build=$(echo "$local_substage_ds_info" | jq -r '.build')
-                    nested_stages=$(_get_nested_stages "$ds_job" "$ds_build" "$local_substage_display_name" "$((nesting_depth + 1))" "$local_substage_name" "$stage_parallel_path" 2>/dev/null) || nested_stages="[]"
+                    local nested_stages
+                    nested_stages="[]"
+                    if [[ -n "$recursive_dir" && -f "${recursive_output_files[$recursive_result_idx]}" ]]; then
+                        nested_stages=$(cat "${recursive_output_files[$recursive_result_idx]}" 2>/dev/null)
+                    fi
+                    [[ -z "$nested_stages" ]] && nested_stages="[]"
+                    recursive_result_idx=$((recursive_result_idx + 1))
 
                     nested_stages=$(echo "$nested_stages" | jq \
                         --arg pb "$parallel_branch" \
@@ -1024,10 +1235,11 @@ _get_nested_stages() {
 
         local nested_stages="[]"
         if [[ -n "$ds_info" && "$ds_info" != "null" ]]; then
-            local ds_job ds_build
-            ds_job=$(echo "$ds_info" | jq -r '.job')
-            ds_build=$(echo "$ds_info" | jq -r '.build')
-            nested_stages=$(_get_nested_stages "$ds_job" "$ds_build" "$display_name" "$((nesting_depth + 1))" "$stage_name" "$stage_parallel_path" 2>/dev/null) || nested_stages="[]"
+            if [[ -n "$recursive_dir" && -f "${recursive_output_files[$recursive_result_idx]}" ]]; then
+                nested_stages=$(cat "${recursive_output_files[$recursive_result_idx]}" 2>/dev/null)
+            fi
+            [[ -z "$nested_stages" ]] && nested_stages="[]"
+            recursive_result_idx=$((recursive_result_idx + 1))
 
             if [[ -n "$parallel_branch" ]]; then
                 nested_stages=$(echo "$nested_stages" | jq \
@@ -1139,6 +1351,10 @@ _get_nested_stages() {
             result=$(echo "$result" | jq --argjson entry "$rw_entry" '. + [$entry]')
         fi
     done <<< "$remaining_wrappers"
+
+    if [[ -n "$recursive_dir" && -d "$recursive_dir" ]]; then
+        rm -rf "$recursive_dir"
+    fi
 
     echo "$result"
 }

@@ -177,21 +177,11 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ] **Write or update unit tests** as described in the spec's Test Strategy section.
 - [ ] **Run all unit tests** and confirm they pass (both new and existing).
 - [ ] **Write implementation log notes** in a new section `#### Implementation Log`.  See `#### Create Implementation log` section above
-
-
-### 3c Run agent test plan (if present)
-
 - [ ] **Check if the spec references an agent test plan** (look for a `## Agent Test Plan` section or a companion `*-agent-test-plan.md` file). If one exists, execute the test plan and verify it is successful.
-
-### 3d Verify CI/CD build is green
-
 - [ ] **CI/CD gate — MANDATORY before marking IMPLEMENTED.** The spec CANNOT be marked IMPLEMENTED unless the CI/CD build is confirmed GREEN (no failures). Follow this procedure:
-  1. Check if the project has a `buildgit` skill installed (look for a `SKILL.md` in a `skill/buildgit/` directory) and a configured build job (e.g. `JENKINS_URL` is set, or a Jenkinsfile exists).
-  2. **If buildgit is available and a build job is configured:** Commit your changes and run `buildgit push` (or equivalent) and verify the latest build result is SUCCESS with no test failures. If the build is failing, fix the issues and push again. Repeat until the build is GREEN. Do NOT proceed to mark the spec IMPLEMENTED while the build is broken.
-  3. **If buildgit is NOT installed or no build job is configured:** This is acceptable — note it in the `#### Implementation Log` section  under `## CI/CD Verification` Proceed to **Workflow 5 (Finalize)**.
-
-**Before finalize:** Workflow 5 includes a **mandatory** work review (§5c). You **must** read and run the `workreview` skill before setting `State:` to `IMPLEMENTED`. Skipping workreview is not allowed.
-
+- [ ]  **Commit and push** per the project conventions. Use a commit message starting with `impl spec: <xyz.md>` followed by a brief description.
+- [ ]  **Fix build errors** Use `buildgit` skill to push your changes. Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary until the build is GREEN.
+- [ ]  **Run all Finalize steps in workflow 5**  All steps in Workflow 5 must be executed, including workreview generation, changelog/spec updates, and state transition.  
 
 ## Workflow 4: Implement DRAFT Spec using chunk plan (DRAFT → IMPLEMENTED)
 
@@ -213,7 +203,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 - [ ]  **Run all unit tests** and confirm they pass (both new and existing). The **Existing test modification policy** from Workflow 3b applies here as well.
 - [ ]  **Mark chunk complete** Mark ONLY the one chunk you implemented as completed in chunkplan (change '- [ ]' to '- [x]').
 - [ ]  **Commit and push** per the project conventions. Use a commit message starting with `chunk N/T:` followed by a brief description.
-- [ ]  **Fix build errors** Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary.
+- [ ]  **Fix build errors** Use `buildgit` skill to push your changes. Wait for the build to complete. Fix any errors shown.  Repeat this step as necessary until the build is GREEN.
 - [ ]  **Check if this was the last chunk.** Scan the Contents table in the chunk plan. If every chunk row is now `[x]`, proceed immediately to Workflow 5 (Finalize) without waiting for further user instruction. Finalization is a mandatory part of the implementation — it is not a separate user request.
 
 **Blocking failure rule:** If at any point during the per-chunk workflow you encounter a failure that you cannot fix (broken build infrastructure, missing tools, repository configuration errors, or test failures unrelated to your chunk's changes), do NOT output `REMAINING_CHUNKS=n`. Instead, output `RALPH_BLOCKED=<brief reason>` as the final line and stop immediately. Do not attempt the next chunk. If a chunk is abandoned due to `RALPH_BLOCKED`, still record the compaction count and skills used up to the blocking point in the chunk's Implementation Log before stopping.
@@ -221,7 +211,7 @@ When implementing a DRAFT spec or bug fix, follow these steps in order.
 ### Workflow 5 Finalize Implementation
 
 Use this workflow **after** Workflow 3 (single-pass) or **after** all chunks in Workflow 4 are complete. All Steps in Workflow 5 are **MANDATORY** when implementing a spec or a chunkplan.
-
+If any required finalize step cannot be completed, output `SPEC_BLOCKED=<reason>` and stop.
 
 ### 5a Run agent test plan (if present)
 

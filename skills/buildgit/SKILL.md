@@ -135,6 +135,7 @@ Default threads format (`--threads` on TTY monitoring) is:
 Threads placeholders are separate from `--format` placeholders:
 `%a`=agent `%S`=stage `%g`=progress-bar `%p`=percent `%e`=elapsed `%E`=estimate `%%`=literal%
 Use width/alignment like `%14a` or `%-14a`. `BUILDGIT_THREADS_FORMAT` sets the default when `--threads` has no explicit format argument.
+Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-loop iteration while using `push`, `build`, or `status -f`.
 
 ## Interpreting Output
 
@@ -161,6 +162,7 @@ For failures, summarize the failed stage name, error logs, and test failure deta
 When a failure needs more detail, prefer `scripts/buildgit -v status --json` for structured failed-test stdout and `scripts/buildgit status --console-text <stage>` after `scripts/buildgit status --list-stages`.
 `--console-text <stage>` accepts exact, case-insensitive, and unique partial stage matches. If the requested parent stage has no direct log text, it walks descendant substages and emits their logs in pipeline order.
 Normal build/status output goes to stdout, including queue updates, stage progress, completion summaries, and verbose diagnostics. stderr is reserved for invalid input, Jenkins communication failures, and transient TTY redraw sequences.
+With `BUILDGIT_DEBUG_TIMING=1`, monitoring commands also emit `[buildgit-timing] iter=<N> build_info=<ms> stage_track=<ms> total=<ms> building=<bool>` to stderr; the values use second-precision timestamps scaled to milliseconds for bash 3.2 portability.
 Full header output is condensed: `Trigger:` merges cause plus user (`Manual by …`, `SCM change`, `Timer`, `Upstream`), `Commit:` includes the subject line when available, and `Agent:` is a top-level field instead of a boxed Build Info section.
 For jobs that trigger downstream builds, full output now shows a hierarchical `=== Test Results ===` tree with parent and child rows, while one-line output aggregates the `Tests=` counts across the whole tree. In `--json`, the top-level `test_results` totals match the line output and multi-job builds add a `breakdown` array with one entry per parent/downstream build; missing reports are represented as `null` counts.
 

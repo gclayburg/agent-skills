@@ -292,6 +292,29 @@ get_console_output() {
     jenkins_api "${job_path}/${build_number}/consoleText" 2>/dev/null || echo ""
 }
 
+get_console_output_cached() {
+    local job_name="$1"
+    local build_number="$2"
+
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" && -d "$BUILDGIT_ITER_CACHE_DIR" ]]; then
+        local safe_job_name cache_file output
+        safe_job_name=$(printf '%s' "$job_name" | tr '/ ' '__')
+        cache_file="${BUILDGIT_ITER_CACHE_DIR}/console_${safe_job_name}_${build_number}"
+
+        if [[ -f "$cache_file" ]]; then
+            cat "$cache_file"
+            return 0
+        fi
+
+        output=$(get_console_output "$job_name" "$build_number")
+        printf '%s' "$output" > "$cache_file"
+        printf '%s' "$output"
+        return 0
+    fi
+
+    get_console_output "$job_name" "$build_number"
+}
+
 _STAGE_CONSOLE_AVAILABLE_STAGES=""
 _STAGE_CONSOLE_AMBIGUOUS_STAGES=""
 

@@ -14,7 +14,7 @@ _print_deferred_header_fields() {
 
     # Need console output to resolve deferred fields
     local console_output
-    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
+    console_output=$(get_console_output_cached "$job_name" "$build_number" 2>/dev/null) || true
 
     if [[ -z "$console_output" ]]; then
         return 1  # Not yet available
@@ -61,6 +61,29 @@ _print_deferred_header_fields() {
     return 0
 }
 
+_buildgit_iter_cache_begin() {
+    _buildgit_iter_cache_end
+    BUILDGIT_ITER_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/buildgit-iter-cache.XXXXXX")"
+    export BUILDGIT_ITER_CACHE_DIR
+}
+
+_buildgit_iter_cache_end() {
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" ]]; then
+        rm -rf "$BUILDGIT_ITER_CACHE_DIR" 2>/dev/null || true
+        unset BUILDGIT_ITER_CACHE_DIR
+    fi
+}
+
+_buildgit_timing_ms() {
+    local start="$1"
+    local finish="$2"
+    local seconds=$((finish - start))
+    if [[ "$seconds" -lt 0 ]]; then
+        seconds=0
+    fi
+    echo $((seconds * 1000))
+}
+
 # Unified build monitoring loop
 # Polls Jenkins API until build completes, tracking stage changes in real-time
 # Arguments: job_name, build_number
@@ -81,6 +104,7 @@ __buildgit_monitor_build_impl() {
     local stage_log_file=""
     local stage_state_file=""
     local deferred_log_file=""
+    local iter_num=0
     stage_state_file="$(mktemp "${TMPDIR:-/tmp}/buildgit-stage-state.XXXXXX")"
     if [[ "$show_progress_footer" == "true" ]]; then
         if _status_stdout_is_tty; then
@@ -101,8 +125,23 @@ __buildgit_monitor_build_impl() {
     bg_log_info "Monitoring build #${build_number}..."
 
     while [[ $elapsed -lt $MAX_BUILD_TIME ]]; do
+        iter_num=$((iter_num + 1))
+        local iter_start=""
+        local build_info_start=""
+        local build_info_end=""
+        local build_info_ms=0
+        local stage_track_ms=0
+        iter_start=$(date +%s)
+        if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+            build_info_start="$iter_start"
+        fi
+
         local build_info
         build_info=$(get_build_info "$job_name" "$build_number")
+        if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+            build_info_end=$(date +%s)
+            build_info_ms=$(_buildgit_timing_ms "$build_info_start" "$build_info_end")
+        fi
 
         if [[ -z "$build_info" ]]; then
             consecutive_failures=$((consecutive_failures + 1))
@@ -118,17 +157,34 @@ __buildgit_monitor_build_impl() {
                 return 1
             fi
             bg_log_warning "API request failed, retrying... ($consecutive_failures/5)"
-            sleep "$POLL_INTERVAL"
-            elapsed=$((elapsed + POLL_INTERVAL))
+            local iter_end iter_cost sleep_secs
+            iter_end=$(date +%s)
+            iter_cost=$((iter_end - iter_start))
+            if [[ $iter_cost -lt 0 ]]; then
+                iter_cost=0
+            fi
+            if [[ $iter_cost -lt $POLL_INTERVAL ]]; then
+                sleep_secs=$((POLL_INTERVAL - iter_cost))
+                sleep "$sleep_secs"
+            fi
+            if [[ $iter_cost -gt $POLL_INTERVAL ]]; then
+                elapsed=$((elapsed + iter_cost))
+            else
+                elapsed=$((elapsed + POLL_INTERVAL))
+            fi
             line_frame=$((line_frame + 1))
             continue
         fi
 
         consecutive_failures=0
+        _buildgit_iter_cache_begin
 
         local deferred_output=""
         local stage_output=""
         local emit_verbose_progress=false
+        local building result
+        building=$(echo "$build_info" | jq -r '.building')
+        result=$(echo "$build_info" | jq -r '.result // empty')
 
         # Collect deferred-header output first so API calls complete before clear+redraw.
         if [[ "${_DEFERRED_COMMIT:-false}" == "true" || "${_DEFERRED_AGENT:-false}" == "true" || "${_DEFERRED_CONSOLE:-false}" == "true" ]]; then
@@ -141,30 +197,16 @@ __buildgit_monitor_build_impl() {
             fi
         fi
 
-        # Track stage changes BEFORE checking completion
-        # This ensures the final iteration still catches stage transitions
-        # Spec: bug-show-all-stages.md - all stages must be shown
-        # Spec: nested-jobs-display-spec.md - track downstream builds in real-time
-        if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
-            BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
-            stage_state=$(cat "$stage_state_file")
-            stage_output=$(cat "$stage_log_file")
-            : > "$stage_log_file"
-        else
-            BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
-            stage_state=$(cat "$stage_state_file")
-        fi
-
-        local building result
-        building=$(echo "$build_info" | jq -r '.building')
-        result=$(echo "$build_info" | jq -r '.result // empty')
-
-        # Check completion (after stage tracking so final transitions are caught)
+        # Short-circuit directly into completion handling when Jenkins has already
+        # reported a terminal result. Final-stage reconciliation happens in the
+        # settle/flush passes below instead of the top-of-loop tracker.
+        # Spec: monitor-poll-latency-spec.md § 3
         if [[ "$building" == "false" && -n "$result" ]]; then
             if [[ "$showed_progress" == "true" ]]; then
                 _clear_follow_line_progress
                 showed_progress=false
             fi
+            _buildgit_iter_cache_end
             if [[ -n "$deferred_output" ]]; then
                 printf '%s\n' "$deferred_output"
                 deferred_output=""
@@ -176,30 +218,57 @@ __buildgit_monitor_build_impl() {
             # Reconcile late-arriving nested stage metadata before exiting monitor.
             # Jenkins can mark the root build complete slightly before nested
             # stage details are fully available through API/log parsing.
-            # Keep polling until state stabilizes or max settle window expires.
+            # First do one immediate track call, then poll briefly for stability.
+            _buildgit_iter_cache_begin
+            if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
+                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
+                stage_state=$(cat "$stage_state_file")
+                stage_output=$(cat "$stage_log_file")
+                : > "$stage_log_file"
+                if [[ -n "$stage_output" ]]; then
+                    printf '%s\n' "$stage_output"
+                    stage_output=""
+                fi
+            else
+                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
+                stage_state=$(cat "$stage_state_file")
+            fi
+            _buildgit_iter_cache_end
             local settle_elapsed=0
             local stable_polls=0
+            local settle_iterations=0
             local prev_state_fingerprint
             prev_state_fingerprint=$(_stage_state_settle_fingerprint "$stage_state")
             local tracking_complete
             tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
-            while [[ $settle_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && ( $stable_polls -lt $MONITOR_SETTLE_STABLE_POLLS || "$tracking_complete" != "true" ) ]]; do
+            # Exit when fingerprint stable for STABLE_POLLS iterations OR
+            # tracking_complete=true. Empty fd-3 output alone is too eager —
+            # late-arriving stages from the Jenkins API may not be in the next
+            # poll's print stream but ARE in the next state, so we must wait
+            # for state stability (fingerprint match) not just print stability.
+            # NB: continuation uses AND — we want to exit when EITHER stable
+            # OR complete; the prior code used OR here, which required BOTH
+            # and made the loop hit MONITOR_SETTLE_MAX_SECONDS on every
+            # monorepo build where tracking_complete never flipped to true.
+            while [[ $settle_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && $stable_polls -lt $MONITOR_SETTLE_STABLE_POLLS && "$tracking_complete" != "true" ]]; do
                 sleep 1
                 local settle_iteration_start settle_iteration_end settle_iteration_cost
                 settle_iteration_start=$(date +%s)
                 local settle_stage_output=""
-                if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
-                    BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
-                    stage_state=$(cat "$stage_state_file")
-                    settle_stage_output=$(cat "$stage_log_file")
-                    : > "$stage_log_file"
-                    if [[ -n "$settle_stage_output" ]]; then
-                        printf '%s\n' "$settle_stage_output"
-                    fi
-                else
-                    BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
-                    stage_state=$(cat "$stage_state_file")
+                local settle_tmp_log
+                settle_tmp_log="${stage_log_file:-$(mktemp "${TMPDIR:-/tmp}/buildgit-settle-log.XXXXXX")}"
+                _buildgit_iter_cache_begin
+                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$settle_tmp_log" >"$stage_state_file"
+                stage_state=$(cat "$stage_state_file")
+                settle_stage_output=$(cat "$settle_tmp_log")
+                : > "$settle_tmp_log"
+                if [[ -n "$settle_stage_output" ]]; then
+                    printf '%s\n' "$settle_stage_output"
                 fi
+                if [[ -z "$stage_log_file" ]]; then
+                    rm -f "$settle_tmp_log" 2>/dev/null || true
+                fi
+                _buildgit_iter_cache_end
                 settle_iteration_end=$(date +%s)
                 settle_iteration_cost=$((settle_iteration_end - settle_iteration_start + 1))
                 if [[ "$settle_iteration_cost" -lt 1 ]]; then
@@ -215,26 +284,30 @@ __buildgit_monitor_build_impl() {
                     prev_state_fingerprint="$current_state_fingerprint"
                 fi
                 settle_elapsed=$((settle_elapsed + settle_iteration_cost))
+                settle_iterations=$((settle_iterations + 1))
             done
-            if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
-                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
-                stage_state=$(cat "$stage_state_file")
-                stage_output=$(cat "$stage_log_file")
-                : > "$stage_log_file"
-                if [[ -n "$stage_output" ]]; then
-                    printf '%s\n' "$stage_output"
-                fi
-            else
-                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
-                stage_state=$(cat "$stage_state_file")
+            if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+                printf '[buildgit-settle] iterations=%d elapsed=%d stable_polls=%d tracking_complete=%s\n' \
+                    "$settle_iterations" "$settle_elapsed" "$stable_polls" "$tracking_complete" >&2
             fi
-            tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
+            # Always run at least one force-flush pass after the settle loop.
+            # Even when settle exits "cleanly" on empty fd-3 output, late-arriving
+            # parent stages (notably Finalize) may not yet be reflected by the
+            # Jenkins API at the moment settle exited. The flush call uses
+            # _force_flush_completion_stages which re-reads the API and prints
+            # any newly-terminal parents. This costs ~1 iteration but is
+            # required for correctness — see integration_tests.bats
+            # parallel-substages tests which verify Finalize is printed.
             if [[ "$tracking_complete" != "true" ]]; then
                 local flush_elapsed=0
-                while [[ $flush_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && "$tracking_complete" != "true" ]]; do
+                local flush_iterations=0
+                local flush_max_iterations=${MONITOR_FLUSH_MAX_ITERATIONS:-1}
+                while [[ $flush_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && $flush_iterations -lt $flush_max_iterations && "$tracking_complete" != "true" ]]; do
                     sleep 1
+                    flush_iterations=$((flush_iterations + 1))
                     local flush_iteration_start flush_iteration_end flush_iteration_cost
                     flush_iteration_start=$(date +%s)
+                    _buildgit_iter_cache_begin
                     if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
                         BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>"$stage_log_file" >"$stage_state_file"
                         stage_state=$(cat "$stage_state_file")
@@ -247,6 +320,7 @@ __buildgit_monitor_build_impl() {
                         BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>&1 >"$stage_state_file"
                         stage_state=$(cat "$stage_state_file")
                     fi
+                    _buildgit_iter_cache_end
                     flush_iteration_end=$(date +%s)
                     flush_iteration_cost=$((flush_iteration_end - flush_iteration_start + 1))
                     if [[ "$flush_iteration_cost" -lt 1 ]]; then
@@ -256,10 +330,37 @@ __buildgit_monitor_build_impl() {
                     flush_elapsed=$((flush_elapsed + flush_iteration_cost))
                 done
             fi
+            if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+                local total_ms
+                total_ms=$(_buildgit_timing_ms "$iter_start" "$(date +%s)")
+                printf '[buildgit-timing] iter=%d build_info=%d stage_track=%d total=%d building=%s\n' \
+                    "$iter_num" "$build_info_ms" "$stage_track_ms" "$total_ms" "$building" >&2
+            fi
+            _buildgit_iter_cache_end
             rm -f "$stage_log_file" 2>/dev/null || true
             rm -f "$stage_state_file" 2>/dev/null || true
             rm -f "$deferred_log_file" 2>/dev/null || true
             return 0
+        fi
+
+        # Track stage changes for in-progress builds before rendering progress.
+        # Spec: bug-show-all-stages.md - all stages must be shown
+        # Spec: nested-jobs-display-spec.md - track downstream builds in real-time
+        local stage_track_start=""
+        if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+            stage_track_start=$(date +%s)
+        fi
+        if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
+            BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
+            stage_state=$(cat "$stage_state_file")
+            stage_output=$(cat "$stage_log_file")
+            : > "$stage_log_file"
+        else
+            BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
+            stage_state=$(cat "$stage_state_file")
+        fi
+        if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+            stage_track_ms=$(_buildgit_timing_ms "$stage_track_start" "$(date +%s)")
         fi
 
         # Verbose-only elapsed time messages
@@ -295,8 +396,28 @@ __buildgit_monitor_build_impl() {
             showed_progress=true
         fi
 
-        sleep "$POLL_INTERVAL"
-        elapsed=$((elapsed + POLL_INTERVAL))
+        _buildgit_iter_cache_end
+        if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+            local total_ms
+            total_ms=$(_buildgit_timing_ms "$iter_start" "$(date +%s)")
+            printf '[buildgit-timing] iter=%d build_info=%d stage_track=%d total=%d building=%s\n' \
+                "$iter_num" "$build_info_ms" "$stage_track_ms" "$total_ms" "$building" >&2
+        fi
+        local iter_end iter_cost sleep_secs
+        iter_end=$(date +%s)
+        iter_cost=$((iter_end - iter_start))
+        if [[ $iter_cost -lt 0 ]]; then
+            iter_cost=0
+        fi
+        if [[ $iter_cost -lt $POLL_INTERVAL ]]; then
+            sleep_secs=$((POLL_INTERVAL - iter_cost))
+            sleep "$sleep_secs"
+        fi
+        if [[ $iter_cost -gt $POLL_INTERVAL ]]; then
+            elapsed=$((elapsed + iter_cost))
+        else
+            elapsed=$((elapsed + POLL_INTERVAL))
+        fi
         line_frame=$((line_frame + 1))
     done
 
@@ -304,6 +425,7 @@ __buildgit_monitor_build_impl() {
         _clear_follow_line_progress
         echo ""
     fi
+    _buildgit_iter_cache_end
     rm -f "$stage_log_file" 2>/dev/null || true
     rm -f "$stage_state_file" 2>/dev/null || true
     rm -f "$deferred_log_file" 2>/dev/null || true

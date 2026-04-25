@@ -191,6 +191,11 @@ Default line format: `%s #%n id=%c Tests=%t Took %d on %I (%r)`
 Threads placeholders: `%a`=agent `%S`=stage `%g`=progress-bar `%p`=percent `%e`=elapsed `%E`=estimate `%%`=literal%
 Default threads format: `  [%-14a] %S %g %p %e / %E`
 Set `BUILDGIT_THREADS_FORMAT` or pass `--threads '<fmt>'` to customize live per-stage TTY rows.
+Set `BUILDGIT_DEBUG_TIMING=1` during `push`, `build`, or `status -f` to emit stderr timing lines such as:
+
+```bash
+[buildgit-timing] iter=1 build_info=1000 stage_track=2000 total=3000 building=true
+```
 
 If test-report retrieval fails due to communication issues (for example network/sandbox restrictions), `%t` shows `!err!` and buildgit logs:
 

@@ -424,169 +424,158 @@ _print_nested_stage_entry() {
 
 _build_parallel_tracking_state() {
     local current_nested="$1"
-    local previous_parallel_state="${2:-{}}"
+    # NB: "${2:-{}}" expands to "{}}" (extra brace) when $2 is non-empty due to
+    # how bash parses braces inside default-value expansions. Use explicit fall-
+    # through to get the intended behavior.
+    local previous_parallel_state="$2"
+    [[ -z "$previous_parallel_state" ]] && previous_parallel_state="{}"
     local build_info_json current_building="true"
     build_info_json=$(get_build_info "$job_name" "$build_number" 2>/dev/null) || true
     if [[ -n "$build_info_json" ]]; then
-        current_building=$(echo "$build_info_json" | jq -r '.building // true' 2>/dev/null)
+        current_building=$(echo "$build_info_json" | jq -r 'if has("building") and .building != null then .building else true end' 2>/dev/null)
         [[ -z "$current_building" || "$current_building" == "null" ]] && current_building="true"
     fi
 
-    local result="{}"
-    local wrapper_names
-    wrapper_names=$(echo "$current_nested" | jq -r '.[] | select(.is_parallel_wrapper == true) | .name' 2>/dev/null) || true
+    # Perf: the whole parallel-state transition is computed in a single jq
+    # program instead of forking ~10-15 jq calls per wrapper × per branch
+    # every poll iteration. Behavior mirrors the prior implementation exactly
+    # (same structure, same stable-poll semantics, same ready_to_print logic).
+    [[ -z "$current_nested" || "$current_nested" == "null" ]] && current_nested="[]"
+    [[ "$previous_parallel_state" == "null" ]] && previous_parallel_state="{}"
 
-    while IFS= read -r wrapper_name; do
-        [[ -z "$wrapper_name" ]] && continue
+    jq -n \
+        --argjson nested "$current_nested" \
+        --argjson prev "$previous_parallel_state" \
+        --arg building "$current_building" '
+        def is_terminal($s):
+            $s == "SUCCESS" or $s == "FAILED" or $s == "UNSTABLE" or $s == "ABORTED";
+        def is_nonneg_int(v):
+            (v | type) == "number" and v >= 0;
+        def drop_last_seg(p):
+            if p == "" then ""
+            elif (p | contains(".")) then (p | sub("\\.[^.]+$"; ""))
+            else "" end;
+        def last_seg(n):
+            ((n // "") | split("->") | last);
+        def matches_declared_branch($name; $declared; $wprefix):
+            any($declared[]?; . == $name or ($wprefix != "" and ($wprefix + .) == $name));
+        def is_direct_branch_for_wrapper($stage; $wname; $declared; $wprefix):
+            (($stage.is_parallel_wrapper // false) != true)
+            and (
+                (($stage.parallel_wrapper // "") == $wname)
+                or matches_declared_branch(($stage.name // ""); $declared; $wprefix)
+            )
+            and (
+                ((($stage.parallel_branch // "") != "")
+                 and (last_seg($stage.name // "") == ($stage.parallel_branch // "")))
+                or matches_declared_branch(($stage.name // ""); $declared; $wprefix)
+            );
 
-        local wrapper_idx wrapper_depth branch_depth declared_branches known_branches first_known_idx prev_first_idx scan_start
-        wrapper_idx=$(echo "$current_nested" | jq -r --arg w "$wrapper_name" 'to_entries[] | select(.value.name == $w) | .key' | head -1)
-        wrapper_depth=$(echo "$current_nested" | jq -r --arg w "$wrapper_name" '.[] | select(.name == $w) | .nesting_depth // 0' | head -1)
-        branch_depth="$wrapper_depth"
-        declared_branches=$(echo "$current_nested" | jq -c --arg w "$wrapper_name" '.[] | select(.name == $w) | (.parallel_branches // [])' | head -1)
-        known_branches=$(echo "$current_nested" | jq -c --arg w "$wrapper_name" --argjson declared "${declared_branches:-[]}" '
-            [to_entries[] as $e
-             | select((($e.value.parallel_wrapper // "") == $w) or any($declared[]?; . == $e.value.name))
-             | {idx: $e.key, name: $e.value.name, path: ($e.value.parallel_path // ""), depth: ($e.value.nesting_depth // 0)}
-            ]
-        ' 2>/dev/null)
-        [[ -z "$known_branches" || "$known_branches" == "null" ]] && known_branches="[]"
-        known_branches=$(echo "$known_branches" | jq -c 'sort_by(.idx)' 2>/dev/null)
-        branch_depth=$(echo "$known_branches" | jq -r 'if length > 0 then (.[0].depth // empty) else empty end' 2>/dev/null)
-        [[ -z "$branch_depth" ]] && branch_depth="$wrapper_depth"
-        first_known_idx=$(echo "$known_branches" | jq -r 'if length > 0 then .[0].idx else "" end' 2>/dev/null)
-        prev_first_idx=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" '.[$w].first_idx // empty' 2>/dev/null)
-
-        scan_start=""
-        if [[ -n "$first_known_idx" ]]; then
-            scan_start="$first_known_idx"
-        elif [[ -n "$prev_first_idx" ]]; then
-            scan_start="$prev_first_idx"
-        fi
-        [[ -z "$scan_start" ]] && continue
-
-        local branch_entries
-        branch_entries=$(echo "$current_nested" | jq -c \
-            --argjson start "$scan_start" \
-            --argjson end "$wrapper_idx" \
-            --argjson depth "$branch_depth" \
-            '[to_entries[]
-              | select(.key >= $start and .key < $end)
-              | .value + {__idx: .key}
-              | select((.nesting_depth // 0) == $depth and (.is_parallel_wrapper // false) != true)
-             ]' 2>/dev/null)
-        [[ -z "$branch_entries" || "$branch_entries" == "null" ]] && branch_entries="[]"
-
-        local observed_count prev_observed_count stable_polls path_prefix
-        observed_count=$(echo "$branch_entries" | jq 'length' 2>/dev/null) || observed_count=0
-        prev_observed_count=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" '.[$w].observed_count // -1' 2>/dev/null)
-        if [[ "$prev_observed_count" == "$observed_count" ]]; then
-            stable_polls=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" '(.[$w].stable_polls // 0) + 1' 2>/dev/null)
-        else
-            stable_polls=1
-        fi
-
-        path_prefix=$(echo "$known_branches" | jq -r '
-            if length == 0 then ""
-            else
-                .[0].path
-                | if . == "" then ""
-                  elif contains(".") then sub("\\.[^.]+$"; "")
-                  else ""
-                  end
-            end' 2>/dev/null)
-
-        local all_terminal="true"
-        local all_ready="true"
-        local branch_state="{}"
-        local wrapper_status wrapper_duration wrapper_terminal=false
-        wrapper_status=$(echo "$current_nested" | jq -r --arg w "$wrapper_name" '.[] | select(.name == $w) | .status' | head -1)
-        wrapper_duration=$(echo "$current_nested" | jq -r --arg w "$wrapper_name" '.[] | select(.name == $w) | .durationMillis' | head -1)
-        if _stage_status_is_terminal "$wrapper_status"; then
-            wrapper_terminal=true
-        fi
-        local branch_index=0
-        while [[ $branch_index -lt $observed_count ]]; do
-            local branch_name branch_status branch_duration branch_fingerprint prev_branch_fingerprint prev_branch_status branch_stable_polls branch_ready
-            branch_name=$(echo "$branch_entries" | jq -r ".[$branch_index].name")
-            branch_status=$(echo "$branch_entries" | jq -r ".[$branch_index].status")
-            branch_duration=$(echo "$branch_entries" | jq -r ".[$branch_index].durationMillis")
-            branch_fingerprint=$(echo "$branch_entries" | jq -c ".[$branch_index] | {status, durationMillis}" 2>/dev/null)
-            prev_branch_fingerprint=$(echo "$previous_parallel_state" | jq -c --arg w "$wrapper_name" --arg b "$branch_name" '.[$w].branch_state[$b].fingerprint // {}' 2>/dev/null)
-            prev_branch_status=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" --arg b "$branch_name" '.[$w].branch_state[$b].fingerprint.status // empty' 2>/dev/null)
-            if [[ -n "$branch_fingerprint" && "$branch_fingerprint" == "$prev_branch_fingerprint" ]]; then
-                branch_stable_polls=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" --arg b "$branch_name" '(.[$w].branch_state[$b].stable_polls // 0) + 1' 2>/dev/null)
-            else
-                branch_stable_polls=1
-            fi
-            branch_ready="false"
-            local terminal_transition=false
-            if [[ -n "$prev_branch_status" ]] && ! _stage_status_is_terminal "$prev_branch_status" && _stage_status_is_terminal "$branch_status"; then
-                terminal_transition=true
-            fi
-            if _stage_status_is_terminal "$branch_status" \
-                && [[ -n "$branch_duration" && "$branch_duration" != "null" && "$branch_duration" =~ ^[0-9]+$ ]] \
-                && [[ "$branch_duration" -ge 1000 || "$current_building" == "false" ]] \
-                && ([[ "$terminal_transition" == "true" && "$wrapper_terminal" != "true" ]] || [[ "$branch_stable_polls" -ge 2 ]]); then
-                branch_ready="true"
-            fi
-            if ! _stage_status_is_terminal "$branch_status"; then
-                all_terminal="false"
-                all_ready="false"
-            elif [[ "$branch_ready" != "true" ]]; then
-                all_ready="false"
-            fi
-            branch_state=$(echo "$branch_state" | jq \
-                --arg b "$branch_name" \
-                --argjson fingerprint "$branch_fingerprint" \
-                --argjson stable_polls "$branch_stable_polls" \
-                --argjson ready "$branch_ready" \
-                '. + {($b): {fingerprint: $fingerprint, stable_polls: $stable_polls, ready_to_print: $ready}}')
-            branch_index=$((branch_index + 1))
-        done
-
-        local wrapper_fingerprint prev_wrapper_fingerprint wrapper_stable_polls ready_to_print
-        wrapper_fingerprint=$(jq -cn --arg s "$wrapper_status" --argjson d "${wrapper_duration:-0}" '{status: $s, durationMillis: $d}')
-        prev_wrapper_fingerprint=$(echo "$previous_parallel_state" | jq -c --arg w "$wrapper_name" '.[$w].wrapper_fingerprint // {}' 2>/dev/null)
-        if [[ -n "$wrapper_fingerprint" && "$wrapper_fingerprint" == "$prev_wrapper_fingerprint" ]]; then
-            wrapper_stable_polls=$(echo "$previous_parallel_state" | jq -r --arg w "$wrapper_name" '(.[$w].wrapper_stable_polls // 0) + 1' 2>/dev/null)
-        else
-            wrapper_stable_polls=1
-        fi
-        ready_to_print="false"
-        if _stage_status_is_terminal "$wrapper_status" \
-            && [[ -n "$wrapper_duration" && "$wrapper_duration" != "null" && "$wrapper_duration" =~ ^[0-9]+$ \
-                && "$all_terminal" == "true" && "$all_ready" == "true" && "$stable_polls" -ge 2 && "$wrapper_stable_polls" -ge 2 && "$observed_count" -gt 0 ]]; then
-            ready_to_print="true"
-        fi
-
-        result=$(echo "$result" | jq \
-            --arg w "$wrapper_name" \
-            --argjson branches "$branch_entries" \
-            --argjson observed_count "$observed_count" \
-            --argjson stable_polls "$stable_polls" \
-            --argjson first_idx "$scan_start" \
-            --arg path_prefix "$path_prefix" \
-            --argjson branch_state "$branch_state" \
-            --argjson wrapper_fingerprint "$wrapper_fingerprint" \
-            --argjson wrapper_stable_polls "$wrapper_stable_polls" \
-            --argjson ready "$ready_to_print" \
-            '. + {
-                ($w): {
-                    branches: $branches,
+        ($nested // []) as $nested
+        | ($prev // {}) as $prev
+        | ($nested | to_entries | map(select(.value.is_parallel_wrapper == true))) as $wrappers
+        | reduce $wrappers[] as $we ({__buildgit_building: $building};
+            . as $acc
+            | $we.value.name as $wname
+            | $we.key as $wrapper_idx
+            | ($we.value.nesting_depth // 0) as $wrapper_depth
+            | ($we.value.parallel_branches // []) as $declared
+            # When the wrapper itself has a prefix (a nested parallel
+            # wrapper, e.g. "Build SignalBoot->Publish and Archive"), the
+            # assembled branches under it carry the same prefix on their
+            # name (e.g. "Build SignalBoot->Docker Push") but the original
+            # parallel_wrapper field still holds the bare local name
+            # ("Publish and Archive"). Match these prefixed branches by
+            # composing prefix + "->" + declared_name.
+            | ((($wname | split("->")) as $segs
+                | if ($segs | length) > 1
+                  then (($segs[0:-1]) | join("->")) + "->"
+                  else "" end)) as $wprefix
+            | ([ $nested | to_entries[] as $e
+                 | select(is_direct_branch_for_wrapper($e.value; $wname; $declared; $wprefix))
+                 | { idx: $e.key,
+                     name: $e.value.name,
+                     path: ($e.value.parallel_path // ""),
+                     depth: ($e.value.nesting_depth // 0) } ]
+               | sort_by(.idx)) as $known
+            | (if ($known | length) > 0 then ($known[0].depth // $wrapper_depth)
+               else $wrapper_depth end) as $branch_depth
+            | (if ($known | length) > 0 then $known[0].idx else null end) as $first_known_idx
+            | (($prev[$wname].first_idx // null)) as $prev_first_idx
+            | (if $first_known_idx != null then $first_known_idx
+               elif $prev_first_idx != null then $prev_first_idx
+               else null end) as $scan_start
+            | if $scan_start == null then $acc
+              else
+                ([ $nested | to_entries[]
+                   | select(.key >= $scan_start and .key < $wrapper_idx)
+                   | (.value + { __idx: .key })
+                   | select(((.nesting_depth // 0) == $branch_depth)
+                            and is_direct_branch_for_wrapper(.; $wname; $declared; $wprefix)) ]) as $branch_entries
+                | ($branch_entries | length) as $observed_count
+                | (($prev[$wname].observed_count // -1)) as $prev_observed_count
+                | (if $prev_observed_count == $observed_count
+                   then ($prev[$wname].stable_polls // 0) + 1
+                   else 1 end) as $stable_polls
+                | (if ($known | length) == 0 then ""
+                   else drop_last_seg($known[0].path // "") end) as $path_prefix
+                | ($we.value.status // "") as $wstatus
+                | ($we.value.durationMillis // null) as $wdur
+                | is_terminal($wstatus) as $wrapper_terminal
+                | (reduce ($branch_entries[]) as $be (
+                    { state: {}, all_terminal: true, all_ready: true };
+                    .state as $bs
+                    | $be.name as $bname
+                    | ($be.status // "") as $bstatus
+                    | ($be.durationMillis // null) as $bdur
+                    | ({ status: $bstatus, durationMillis: $bdur }) as $bfp
+                    | (($prev[$wname].branch_state[$bname].fingerprint // {})) as $prev_bfp
+                    | (($prev[$wname].branch_state[$bname].fingerprint.status // null)) as $prev_bstatus
+                    | (if $bfp == $prev_bfp
+                       then ($prev[$wname].branch_state[$bname].stable_polls // 0) + 1
+                       else 1 end) as $bstable
+                    | (($prev_bstatus != null)
+                       and ((is_terminal($prev_bstatus)) | not)
+                       and is_terminal($bstatus)) as $terminal_transition
+                    | (is_terminal($bstatus)
+                       and is_nonneg_int($bdur)
+                       and ($bdur >= 1000 or $building == "false")
+                       and (($terminal_transition and ($wrapper_terminal | not))
+                            or $bstable >= 2)) as $bready
+                    | .state = ($bs + { ($bname): { fingerprint: $bfp, stable_polls: $bstable, ready_to_print: $bready } })
+                    | if (is_terminal($bstatus) | not)
+                        then .all_terminal = false | .all_ready = false
+                      elif ($bready | not) then .all_ready = false
+                      else . end
+                  )) as $scan
+                | $scan.state as $branch_state
+                | $scan.all_terminal as $all_terminal
+                | $scan.all_ready as $all_ready
+                | ({ status: $wstatus, durationMillis: $wdur }) as $wfp
+                | (($prev[$wname].wrapper_fingerprint // {})) as $prev_wfp
+                | (if $wfp == $prev_wfp
+                   then ($prev[$wname].wrapper_stable_polls // 0) + 1
+                   else 1 end) as $wrapper_stable_polls
+                | (is_terminal($wstatus)
+                   and is_nonneg_int($wdur)
+                   and $all_terminal and $all_ready
+                   and $stable_polls >= 2
+                   and $wrapper_stable_polls >= 2
+                   and $observed_count > 0) as $ready_to_print
+                | $acc + { ($wname): {
+                    branches: $branch_entries,
                     observed_count: $observed_count,
                     stable_polls: $stable_polls,
-                    first_idx: $first_idx,
+                    first_idx: $scan_start,
                     path_prefix: $path_prefix,
                     branch_state: $branch_state,
-                    wrapper_fingerprint: $wrapper_fingerprint,
+                    wrapper_fingerprint: $wfp,
                     wrapper_stable_polls: $wrapper_stable_polls,
-                    ready_to_print: $ready
-                }
-            }')
-    done <<< "$wrapper_names"
-
-    echo "$result"
+                    ready_to_print: $ready_to_print
+                  } }
+              end
+          )
+    '
 }
 
 _get_parallel_wrapper_for_stage() {
@@ -628,6 +617,35 @@ _parallel_wrapper_ready_to_print() {
     local wrapper_name="$2"
 
     echo "$parallel_state" | jq -r --arg w "$wrapper_name" '.[$w].ready_to_print // false' 2>/dev/null
+}
+
+_parallel_wrapper_branches_printed_fast() {
+    local stage_entry="$1"
+
+    local branches
+    branches=$(echo "$stage_entry" | jq -r '.parallel_branches[]? // empty' 2>/dev/null) || branches=""
+    if [[ -z "$branches" ]]; then
+        return 1
+    fi
+
+    local branch_name found branch_idx
+    while IFS= read -r branch_name; do
+        [[ -z "$branch_name" ]] && continue
+        found=false
+        branch_idx=0
+        while [[ $branch_idx -lt ${#_ts_names[@]} ]]; do
+            if [[ "${_ts_names[$branch_idx]}" == "$branch_name" && "${_ts_printed_terminal[$branch_idx]}" == "true" ]]; then
+                found=true
+                break
+            fi
+            branch_idx=$((branch_idx + 1))
+        done
+        if [[ "$found" != "true" ]]; then
+            return 1
+        fi
+    done <<< "$branches"
+
+    return 0
 }
 
 _parallel_branch_entry_with_path() {
@@ -720,6 +738,43 @@ _stage_blocked_by_unprinted_predecessor() {
     return 1
 }
 
+# Fast variant — pure-bash predicate that reads the aligned per-stage arrays
+# precomputed by _track_nested_stage_changes. Avoids the O(N^2) × ~7 jq forks
+# the legacy variant costs on monorepo builds.
+# Inputs (globals, set by the tracker before calling):
+#   _ts_is_terminal_status, _ts_printed_terminal, _ts_group
+# Arguments: current_index
+# Returns 0 if a prior non-same-group terminal stage is still unprinted.
+_stage_blocked_by_unprinted_predecessor_fast() {
+    local current_index="$1"
+    local stage_group="${_ts_group[$current_index]}"
+    local prior=0
+    while [[ $prior -lt $current_index ]]; do
+        if [[ "${_ts_is_terminal_status[$prior]}" == "1" && "${_ts_printed_terminal[$prior]}" != "true" ]]; then
+            if [[ "${_ts_is_direct_branch[$prior]:-false}" == "true" ]]; then
+                local prior_name="${_ts_names[$prior]}"
+                local prior_prefix="${prior_name}->"
+                local child_name child_count=0
+                for child_name in "${_ts_names[@]}"; do
+                    case "$child_name" in
+                        "${prior_prefix}"*) child_count=$((child_count + 1)) ;;
+                    esac
+                done
+                if [[ "$child_count" -gt 0 ]]; then
+                    prior=$((prior + 1))
+                    continue
+                fi
+            fi
+            local prior_group="${_ts_group[$prior]}"
+            if [[ -z "$stage_group" || -z "$prior_group" || "$stage_group" != "$prior_group" ]]; then
+                return 0
+            fi
+        fi
+        prior=$((prior + 1))
+    done
+    return 1
+}
+
 _nested_tracking_complete() {
     local current_nested="$1"
     local current_parent_stages="$2"
@@ -773,34 +828,81 @@ _force_flush_completion_stages() {
     [[ -z "$current_parent_stages" || "$current_parent_stages" == "null" ]] && current_parent_stages="[]"
     [[ -z "$current_nested" || "$current_nested" == "null" ]] && current_nested="[]"
 
-    local nested_count=0
-    nested_count=$(echo "$current_nested" | jq 'length' 2>/dev/null) || nested_count=0
+    # Perf: batch-extract per-stage fields up front; avoids 4+ jq forks per
+    # stage in the flush loops (called repeatedly during settle).
+    local -a _ff_names=() _ff_status=() _ff_duration=() _ff_entry=()
+    local _ff_n _ff_s _ff_d _ff_e
+    while IFS=$'\t' read -r _ff_n _ff_s _ff_d _ff_e; do
+        [[ -z "$_ff_n" ]] && continue
+        _ff_names+=("$_ff_n")
+        _ff_status+=("$_ff_s")
+        _ff_duration+=("$_ff_d")
+        _ff_entry+=("$_ff_e")
+    done < <(echo "$current_nested" | jq -r '.[]? | [.name, .status, (.durationMillis|tostring), tojson] | @tsv' 2>/dev/null)
+
+    # Printed-state snapshot (read-only cache; updates mutate the JSON).
+    local -a _ffp_names=() _ffp_terminal=()
+    local _ffp_n _ffp_t
+    while IFS=$'\t' read -r _ffp_n _ffp_t; do
+        [[ -z "$_ffp_n" ]] && continue
+        _ffp_names+=("$_ffp_n")
+        _ffp_terminal+=("$_ffp_t")
+    done < <(echo "$printed_state" | jq -r 'to_entries[]? | [.key, (.value.terminal // false|tostring)] | @tsv' 2>/dev/null)
+
+    local nested_count=${#_ff_names[@]}
     local i=0
     while [[ $i -lt $nested_count ]]; do
         local stage_entry stage_name stage_status duration_ms printed_terminal
-        stage_entry=$(echo "$current_nested" | jq -c ".[$i]")
-        stage_name=$(echo "$stage_entry" | jq -r '.name')
-        stage_status=$(echo "$stage_entry" | jq -r '.status')
-        duration_ms=$(echo "$stage_entry" | jq -r '.durationMillis')
-        printed_terminal=$(echo "$printed_state" | jq -r --arg s "$stage_name" '.[$s].terminal // false' 2>/dev/null)
+        stage_name="${_ff_names[$i]}"
+        stage_status="${_ff_status[$i]}"
+        duration_ms="${_ff_duration[$i]}"
+        stage_entry="${_ff_entry[$i]}"
+        printed_terminal="false"
+        local _k=0
+        while [[ $_k -lt ${#_ffp_names[@]} ]]; do
+            if [[ "${_ffp_names[$_k]}" == "$stage_name" ]]; then
+                printed_terminal="${_ffp_terminal[$_k]}"
+                break
+            fi
+            _k=$((_k + 1))
+        done
         if _stage_status_is_terminal "$stage_status" \
             && [[ "$printed_terminal" != "true" ]] \
             && [[ -n "$duration_ms" && "$duration_ms" != "null" && "$duration_ms" =~ ^[0-9]+$ ]]; then
             _print_nested_stage_entry "$stage_entry"
             printed_state=$(echo "$printed_state" | jq --arg s "$stage_name" '.[$s] = ((.[$s] // {}) + {terminal: true})')
+            _ffp_names+=("$stage_name")
+            _ffp_terminal+=("true")
         fi
         i=$((i + 1))
     done
 
-    local parent_count=0
-    parent_count=$(echo "$current_parent_stages" | jq 'length' 2>/dev/null) || parent_count=0
+    # Parent-stages batch extraction.
+    local -a _fp_names=() _fp_status=() _fp_duration=()
+    local _fp_n _fp_s _fp_d
+    while IFS=$'\t' read -r _fp_n _fp_s _fp_d; do
+        [[ -z "$_fp_n" ]] && continue
+        _fp_names+=("$_fp_n")
+        _fp_status+=("$_fp_s")
+        _fp_duration+=("$_fp_d")
+    done < <(echo "$current_parent_stages" | jq -r '.[]? | [.name, .status, (.durationMillis|tostring)] | @tsv' 2>/dev/null)
+
+    local parent_count=${#_fp_names[@]}
     i=0
     while [[ $i -lt $parent_count ]]; do
         local stage_name stage_status duration_ms printed_terminal nested_match branch_local_substage_match
-        stage_name=$(echo "$current_parent_stages" | jq -r ".[$i].name")
-        stage_status=$(echo "$current_parent_stages" | jq -r ".[$i].status")
-        duration_ms=$(echo "$current_parent_stages" | jq -r ".[$i].durationMillis")
-        printed_terminal=$(echo "$printed_state" | jq -r --arg s "$stage_name" '.[$s].terminal // false' 2>/dev/null)
+        stage_name="${_fp_names[$i]}"
+        stage_status="${_fp_status[$i]}"
+        duration_ms="${_fp_duration[$i]}"
+        printed_terminal="false"
+        local _k=0
+        while [[ $_k -lt ${#_ffp_names[@]} ]]; do
+            if [[ "${_ffp_names[$_k]}" == "$stage_name" ]]; then
+                printed_terminal="${_ffp_terminal[$_k]}"
+                break
+            fi
+            _k=$((_k + 1))
+        done
         branch_local_substage_match=$(echo "$current_nested" | jq -c --arg n "$stage_name" '
             [.[] | select((.parent_branch_stage? != null) and ((.name // "") | split("->") | last) == $n)][0]
         ' 2>/dev/null | head -1)
@@ -884,64 +986,174 @@ _track_nested_stage_changes() {
         printed_state=$(echo "$seeded_printed" "$printed_state" | jq -s '.[0] * .[1]' 2>/dev/null) || printed_state="$seeded_printed"
     fi
 
+    local _ts_dbg_t0 _ts_dbg_t1 _ts_dbg_t2 _ts_dbg_t3 _ts_dbg_t3b _ts_dbg_t4
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t0=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+
     local current_parent_stages
     current_parent_stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || current_parent_stages="[]"
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t1=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
 
     local current_nested
     current_nested=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || current_nested="[]"
     if [[ -z "$current_nested" || "$current_nested" == "null" ]]; then
         current_nested="[]"
     fi
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t2=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
 
     local parallel_state
     parallel_state=$(_build_parallel_tracking_state "$current_nested" "$previous_parallel_state")
     [[ -z "$parallel_state" || "$parallel_state" == "null" ]] && parallel_state="{}"
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
 
-    local stage_count
-    stage_count=$(echo "$current_nested" | jq 'length' 2>/dev/null) || stage_count=0
+    # Perf: batch-extract per-stage fields + per-stage lookups against
+    # previous_nested and printed_state in a single jq pass. All loop-body
+    # state for stage i lives at index i in parallel bash arrays — the tracker
+    # loop forks zero jqs per stage for the read path, and only forks when a
+    # mutating write happens (rare, bounded by the number of emitted prints).
+    # Separator is ASCII Unit Separator (\x1f, non-whitespace) so empty fields
+    # between delimiters are preserved by bash read. Using \t would collapse
+    # adjacent tabs because tab is IFS-whitespace.
+    local _ts_sep=$'\x1f'
+    local -a _ts_names=() _ts_status=() _ts_duration=() _ts_entry=()
+    local -a _ts_parallel_wrapper=() _ts_is_parallel_wrapper=()
+    local -a _ts_is_terminal_status=() _ts_has_downstream=() _ts_group=()
+    local -a _ts_previous_status=() _ts_printed_terminal=() _ts_printed_running=()
+    local -a _ts_is_direct_branch=()
+    local _ts_n _ts_s _ts_d _ts_pw _ts_ipw _ts_term _ts_hd _ts_g _ts_prev _ts_pt _ts_pr _ts_db _ts_e
+    while IFS="$_ts_sep" read -r _ts_n _ts_s _ts_d _ts_pw _ts_ipw _ts_term _ts_hd _ts_g _ts_prev _ts_pt _ts_pr _ts_db _ts_e; do
+        [[ -z "$_ts_n" ]] && continue
+        _ts_names+=("$_ts_n")
+        _ts_status+=("$_ts_s")
+        _ts_duration+=("$_ts_d")
+        _ts_parallel_wrapper+=("$_ts_pw")
+        _ts_is_parallel_wrapper+=("$_ts_ipw")
+        _ts_is_terminal_status+=("$_ts_term")
+        _ts_has_downstream+=("$_ts_hd")
+        _ts_group+=("$_ts_g")
+        _ts_previous_status+=("$_ts_prev")
+        _ts_printed_terminal+=("$_ts_pt")
+        _ts_printed_running+=("$_ts_pr")
+        _ts_is_direct_branch+=("$_ts_db")
+        _ts_entry+=("$_ts_e")
+    done < <(echo "$current_nested" | jq -r \
+        --argjson prev "$previous_nested" \
+        --argjson printed "$printed_state" \
+        --arg sep $'\x1f' '
+        (($prev // []) | map({(.name): (.status // "NOT_EXECUTED")}) | add // {}) as $prev_map |
+        .[] | . as $s | [
+            ($s.name // ""),
+            ($s.status // ""),
+            (($s.durationMillis // "") | tostring),
+            ($s.parallel_wrapper // ""),
+            (if ($s.is_parallel_wrapper // false) == true then "true" else "false" end),
+            (if ($s.status == "SUCCESS" or $s.status == "FAILED" or $s.status == "UNSTABLE" or $s.status == "ABORTED") then "1" else "0" end),
+            (($s.has_downstream // false) | tostring),
+            (if ($s.parallel_wrapper // "") != "" then $s.parallel_wrapper
+             elif ($s.is_parallel_wrapper // false) == true then ($s.name // "")
+             else "" end),
+            ($prev_map[$s.name // ""] // "NOT_EXECUTED"),
+            (($printed[$s.name // ""].terminal // false) | tostring),
+            (($printed[$s.name // ""].running // false) | tostring),
+            # is_direct_branch: stage is a direct parallel branch (versus
+            # a sub-stage that inherited parallel_wrapper from its parent).
+            # The computed parallel_state branch list can include expanded
+            # downstream child stages because they share the parent branch
+            # depth in the assembled nested list. The explicit parallel_branch
+            # identity from _get_nested_stages is the reliable signal here.
+            (if ($s.parallel_wrapper // "") != ""
+                and (($s.parallel_branch // "") != ""
+                     and (($s.parallel_branch // "")
+                          == (($s.name // "") | split("->") | last)))
+             then "true" else "false" end),
+            ($s | tojson)
+        ] | join($sep)
+    ' 2>/dev/null)
+
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3b=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+
+    local stage_count=${#_ts_names[@]}
+    # Diagnostic counters (emitted under BUILDGIT_DEBUG_TIMING) so we can tell
+    # whether stages are held back by blocking predecessors, unready parallel
+    # wrappers, or unready parallel branches — the three reasons a completed
+    # stage can go unprinted during the main loop.
+    local _dbg_printed_this_iter=0
+    local _dbg_blocked_predecessor=0
+    local _dbg_wrapper_not_ready=0
+    local _dbg_branch_not_ready=0
+    local _dbg_allow_print_false=0
+    local _dbg_terminal_already_printed=0
+    local _dbg_terminal_waiting=0
     local i=0
     while [[ $i -lt $stage_count ]]; do
         local stage_entry stage_name current_status duration_ms
-        stage_entry=$(echo "$current_nested" | jq -c ".[$i]")
-        stage_name=$(echo "$stage_entry" | jq -r '.name')
-        current_status=$(echo "$stage_entry" | jq -r '.status')
-        duration_ms=$(echo "$stage_entry" | jq -r '.durationMillis')
-
-        local previous_status
-        previous_status=$(echo "$previous_nested" | jq -r --arg n "$stage_name" '.[] | select(.name == $n) | .status // "NOT_EXECUTED"' 2>/dev/null)
-        [[ -z "$previous_status" ]] && previous_status="NOT_EXECUTED"
-
-        local printed_terminal printed_running
-        printed_terminal=$(echo "$printed_state" | jq -r --arg s "$stage_name" '.[$s].terminal // false' 2>/dev/null)
-        printed_running=$(echo "$printed_state" | jq -r --arg s "$stage_name" '.[$s].running // false' 2>/dev/null)
-        [[ -z "$printed_terminal" ]] && printed_terminal="false"
-        [[ -z "$printed_running" ]] && printed_running="false"
+        local previous_status printed_terminal printed_running
+        stage_name="${_ts_names[$i]}"
+        current_status="${_ts_status[$i]}"
+        duration_ms="${_ts_duration[$i]}"
+        stage_entry="${_ts_entry[$i]}"
+        previous_status="${_ts_previous_status[$i]}"
+        printed_terminal="${_ts_printed_terminal[$i]}"
+        printed_running="${_ts_printed_running[$i]}"
 
         case "$current_status" in
             SUCCESS|FAILED|UNSTABLE|ABORTED)
                 if [[ "$printed_terminal" != "true" ]]; then
-                    if _stage_blocked_by_unprinted_predecessor "$current_nested" "$printed_state" "$i" "$stage_entry"; then
+                    _dbg_terminal_waiting=$((_dbg_terminal_waiting + 1))
+                    if _stage_blocked_by_unprinted_predecessor_fast "$i"; then
+                        _dbg_blocked_predecessor=$((_dbg_blocked_predecessor + 1))
                         i=$((i + 1))
                         continue
                     fi
 
-                    local parallel_wrapper
-                    parallel_wrapper=$(_get_parallel_wrapper_for_stage "$parallel_state" "$stage_name" "$stage_entry")
+                    local parallel_wrapper=""
+                    if [[ "${_ts_is_parallel_wrapper[$i]}" == "true" ]]; then
+                        parallel_wrapper="$stage_name"
+                    elif [[ "${_ts_is_direct_branch[$i]}" == "true" ]]; then
+                        # Inherited parallel_wrapper is only meaningful when
+                        # this stage is an actual direct branch in the
+                        # wrapper's branch_state map. Sub-stages that only
+                        # inherited the wrapper field from an outer parent
+                        # must NOT enter the parallel-readiness gate — they
+                        # would never satisfy it (they're not in branch_state)
+                        # and would sit unprinted until the final flush.
+                        parallel_wrapper="${_ts_parallel_wrapper[$i]}"
+                    fi
                     if [[ -n "$parallel_wrapper" ]]; then
-                        local is_wrapper ready_branch ready_wrapper resolved_branch_entry
-                        is_wrapper=$(echo "$stage_entry" | jq -r '.is_parallel_wrapper // false' 2>/dev/null)
+                        local is_wrapper="${_ts_is_parallel_wrapper[$i]}"
+                        local ready_branch ready_wrapper resolved_branch_entry
                         if [[ "$is_wrapper" == "true" ]]; then
                             ready_wrapper=$(_parallel_wrapper_ready_to_print "$parallel_state" "$parallel_wrapper")
-                            if [[ "$ready_wrapper" == "true" ]]; then
+                            if [[ "$ready_wrapper" == "true" ]] || _parallel_wrapper_branches_printed_fast "$stage_entry"; then
                                 _print_nested_stage_entry "$stage_entry"
                                 printed_state=$(echo "$printed_state" | jq --arg s "$stage_name" '.[$s] = ((.[$s] // {}) + {terminal: true})')
+                                _ts_printed_terminal[$i]="true"
+                                _dbg_printed_this_iter=$((_dbg_printed_this_iter + 1))
+                            else
+                                _dbg_wrapper_not_ready=$((_dbg_wrapper_not_ready + 1))
                             fi
                         else
                             ready_branch=$(_parallel_branch_ready_to_print "$parallel_state" "$parallel_wrapper" "$stage_name")
-                            if [[ "$ready_branch" == "true" ]]; then
+                            local branch_duration_ready=false
+                            if [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
+                                local branch_child_count=0 _branch_child _branch_prefix
+                                _branch_prefix="${stage_name}->"
+                                for _branch_child in "${_ts_names[@]}"; do
+                                    case "$_branch_child" in
+                                        "${_branch_prefix}"*) branch_child_count=$((branch_child_count + 1)) ;;
+                                    esac
+                                done
+                                if [[ "$duration_ms" -ge 1000 && "$branch_child_count" -eq 0 ]]; then
+                                    branch_duration_ready=true
+                                fi
+                            fi
+                            if [[ "$ready_branch" == "true" || "$branch_duration_ready" == "true" ]]; then
                                 resolved_branch_entry=$(_parallel_branch_entry_with_path "$parallel_state" "$parallel_wrapper" "$stage_name") || resolved_branch_entry="$stage_entry"
                                 _print_nested_stage_entry "$resolved_branch_entry"
                                 printed_state=$(echo "$printed_state" | jq --arg s "$stage_name" '.[$s] = ((.[$s] // {}) + {terminal: true})')
+                                _ts_printed_terminal[$i]="true"
+                                _dbg_printed_this_iter=$((_dbg_printed_this_iter + 1))
+                            else
+                                _dbg_branch_not_ready=$((_dbg_branch_not_ready + 1))
                             fi
                         fi
                         i=$((i + 1))
@@ -954,11 +1166,14 @@ _track_nested_stage_changes() {
                             allow_print=false
                         fi
                     fi
-                    local has_ds
-                    has_ds=$(echo "$stage_entry" | jq -r '.has_downstream // false')
-                    if [[ "$allow_print" == "true" && "$has_ds" == "true" ]]; then
-                        local ds_child_count
-                        ds_child_count=$(echo "$current_nested" | jq --arg pfx "${stage_name}->" '[.[] | select(.name | startswith($pfx))] | length')
+                    if [[ "$allow_print" == "true" && "${_ts_has_downstream[$i]}" == "true" ]]; then
+                        local ds_child_count=0 _cn _pfx
+                        _pfx="${stage_name}->"
+                        for _cn in "${_ts_names[@]}"; do
+                            case "$_cn" in
+                                "${_pfx}"*) ds_child_count=$((ds_child_count + 1)) ;;
+                            esac
+                        done
                         if [[ "$ds_child_count" -eq 0 ]]; then
                             allow_print=false
                         fi
@@ -966,23 +1181,45 @@ _track_nested_stage_changes() {
                     if [[ "$allow_print" == "true" ]]; then
                         _print_nested_stage_entry "$stage_entry"
                         printed_state=$(echo "$printed_state" | jq --arg s "$stage_name" '.[$s] = ((.[$s] // {}) + {terminal: true})')
+                        _ts_printed_terminal[$i]="true"
+                        _dbg_printed_this_iter=$((_dbg_printed_this_iter + 1))
+                    else
+                        _dbg_allow_print_false=$((_dbg_allow_print_false + 1))
                     fi
+                else
+                    _dbg_terminal_already_printed=$((_dbg_terminal_already_printed + 1))
                 fi
                 ;;
             IN_PROGRESS)
                 if [[ "$verbose" == "true" && "$printed_running" != "true" && "$previous_status" == "NOT_EXECUTED" ]]; then
                     _print_nested_stage_entry "$stage_entry"
                     printed_state=$(echo "$printed_state" | jq --arg s "$stage_name" '.[$s] = ((.[$s] // {}) + {running: true})')
+                    _ts_printed_running[$i]="true"
                 fi
                 ;;
         esac
 
         i=$((i + 1))
     done
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t4=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
 
     local tracking_complete=false
     if _nested_tracking_complete "$current_nested" "$current_parent_stages" "$printed_state"; then
         tracking_complete=true
+    fi
+
+    if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+        printf '[buildgit-timing-detail] parent=%d nested=%d parallel=%d prologue=%d body=%d stages=%d\n' \
+            $((_ts_dbg_t1 - _ts_dbg_t0)) \
+            $((_ts_dbg_t2 - _ts_dbg_t1)) \
+            $((_ts_dbg_t3 - _ts_dbg_t2)) \
+            $((_ts_dbg_t3b - _ts_dbg_t3)) \
+            $((_ts_dbg_t4 - _ts_dbg_t3b)) \
+            "$stage_count" >&2
+        printf '[buildgit-print] printed=%d terminal_waiting=%d blocked_predecessor=%d wrapper_not_ready=%d branch_not_ready=%d allow_print_false=%d already_printed=%d tracking_complete=%s\n' \
+            "$_dbg_printed_this_iter" "$_dbg_terminal_waiting" "$_dbg_blocked_predecessor" \
+            "$_dbg_wrapper_not_ready" "$_dbg_branch_not_ready" "$_dbg_allow_print_false" \
+            "$_dbg_terminal_already_printed" "$tracking_complete" >&2
     fi
 
     # Return composite state with legacy keys retained for test/backward compatibility
