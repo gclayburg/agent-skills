@@ -128,17 +128,17 @@ Finished: FAILURE
 
 ## Hierarchical downstream test results
 
-For multi-component pipelines, full output now keeps the parent job row and adds one row per downstream build, then reports aggregate totals:
+For multi-component pipelines, full output now keeps the parent job row and adds one row per downstream build (with the Jenkins job name and build number), then reports aggregate totals:
 
 ```bash
 $ buildgit --job phandlemono-IT status 73 --all
 ...
-=== Test Results ===
-phandlemono-IT       Total:  ? | Passed:  ? | Failed: ? | Skipped: ?
-  Build SignalBoot   Total: 15 | Passed: 14 | Failed: 1 | Skipped: 0
-  Build Handle       Total: 83 | Passed: 83 | Failed: 0 | Skipped: 0
+=== Test Results ===                             Total  Passed/Failed/Skipped
+phandlemono-IT      phandlemono-IT #73              ?   ?/?/?
+  Build SignalBoot  phandlemono-signalboot #63     15  14/1/0
+  Build Handle      phandlemono-handle #66         83  83/0/0
 --------------------
-Totals                     98 | Passed: 97 | Failed: 1 | Skipped: 0
+Totals                                             98  97/1/0
 ====================
 ```
 
@@ -460,12 +460,12 @@ Console:    http://palmer.garyclayburg.com:18080/job/phandlemono-IT/39/console
 [09:00:09] ℹ   Stage: [agent8_sixcore] E2E Tests (1m 14s)
 [09:00:09] ℹ   Stage: [agent8_sixcore] Declarative: Post Actions (<1s)
 
-=== Test Results ===
-phandlemono-IT      Total: 19 | Passed: 19 | Failed: 0 | Skipped: 0
-  Build SignalBoot  Total: 15 | Passed: 15 | Failed: 0 | Skipped: 0
-  Build Handle      Total: 64 | Passed: 64 | Failed: 0 | Skipped: 0
+=== Test Results ===                             Total  Passed/Failed/Skipped
+phandlemono-IT      phandlemono-IT #75             19  19/0/0
+  Build SignalBoot  phandlemono-signalboot #63     15  15/0/0
+  Build Handle      phandlemono-handle #66         64  64/0/0
 --------------------
-Totals                    98 | Passed: 98 | Failed: 0 | Skipped: 0
+Totals                                             98  98/0/0
 ====================
 
 Finished: SUCCESS

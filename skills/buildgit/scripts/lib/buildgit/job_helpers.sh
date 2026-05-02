@@ -146,9 +146,9 @@ _fetch_multibranch_baselines() {
     local job_path response
 
     job_path=$(jenkins_job_path "$top_job_name")
-    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number]]")
+    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number,building]]")
 
-    echo "$response" | jq '[.jobs[]? | {key: .name, value: (.lastBuild.number // 0)}] | from_entries'
+    echo "$response" | jq '[.jobs[]? | {key: .name, value: {number: (.lastBuild.number // 0), building: (.lastBuild.building // false)}}] | from_entries'
 }
 
 # Validate Jenkins environment, resolve job name, verify connectivity

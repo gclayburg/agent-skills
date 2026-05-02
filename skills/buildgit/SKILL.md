@@ -206,5 +206,6 @@ To inject live build state into context before reasoning about build issues:
 ## References
 
 See [references/buildgit-setup.md](references/buildgit-setup.md) for setup instructions (required tools, fixing permission errors,project setup, needed network access, docker sandbox instructions)
+See [references/post-receive-hook.md](references/post-receive-hook.md) for the git server post-receive hook contract and one-time setup.
 See [references/reference.md](references/reference.md) for real-world output examples
 (push failures, parallel pipelines, progress bars, live follow mode).

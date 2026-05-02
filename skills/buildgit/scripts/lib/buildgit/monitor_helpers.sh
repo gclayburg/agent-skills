@@ -577,31 +577,67 @@ _detect_probe_all_candidate() {
     '
 }
 
+# Convert rich baseline JSON { branch: { number, building } } to flat adjusted map.
+# In-progress builds (building=true) are counted as number-1 so the current poll
+# will immediately satisfy current > baseline for already-running builds.
+_normalize_probe_all_baselines() {
+    local rich_json="$1"
+    echo "$rich_json" | jq 'with_entries(.value = (if .value.building == true and .value.number > 0 then .value.number - 1 else .value.number end))'
+}
+
+# Convert rich baseline JSON to flat map of just build numbers (no adjustment).
+# Used for the "current" side of detection comparisons.
+_flatten_probe_all_baselines() {
+    local rich_json="$1"
+    echo "$rich_json" | jq 'with_entries(.value = .value.number)'
+}
+
+# Return 0 if the given branch name appears in the space-separated in-progress set.
+_branch_was_in_progress() {
+    local branch="$1"
+    local in_progress_set="$2"
+    local b
+    for b in $in_progress_set; do
+        if [[ "$b" == "$branch" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Wait for a new multibranch build to start on any branch.
 # Arguments: top_job_name
 # Prints "branch build_number" on stdout and returns 0 on success.
+# Spec: 2026-04-10_probe-all-initial-build-spec.md
 _follow_wait_probe_all() {
     local top_job_name="$1"
-    local baselines
-    baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    local raw_baselines in_progress_branches baselines
+    raw_baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    in_progress_branches=$(echo "$raw_baselines" | jq -r '[to_entries[] | select(.value.building == true) | .key] | join(" ")')
+    baselines=$(_normalize_probe_all_baselines "$raw_baselines")
 
     log_info "Waiting for Jenkins build ${top_job_name} (any branch) to start..."
 
     while true; do
-        sleep "$POLL_INTERVAL"
-
-        local current detected
-        current=$(_fetch_multibranch_baselines "$top_job_name")
+        local raw_current current detected
+        raw_current=$(_fetch_multibranch_baselines "$top_job_name")
+        current=$(_flatten_probe_all_baselines "$raw_current")
         detected=$(_detect_probe_all_candidate "$baselines" "$current")
 
         if [[ -n "$detected" ]]; then
             local branch build_number
             branch="${detected%% *}"
             build_number="${detected##* }"
-            log_info "Build detected on branch '${branch}' — following ${top_job_name}/${branch} #${build_number}"
+            if _branch_was_in_progress "$branch" "$in_progress_branches"; then
+                log_info "Build already in progress on branch '${branch}' — attaching to ${top_job_name}/${branch} #${build_number}"
+            else
+                log_info "Build detected on branch '${branch}' — following ${top_job_name}/${branch} #${build_number}"
+            fi
             echo "${branch} ${build_number}"
             return 0
         fi
+
+        sleep "$POLL_INTERVAL"
     done
 }
 
@@ -609,28 +645,34 @@ _follow_wait_probe_all() {
 # Arguments: top_job_name, timeout_secs
 # Prints "branch build_number" on stdout and returns 0 on success.
 # Returns 1 if timeout expires before a new build appears.
+# Spec: 2026-04-10_probe-all-initial-build-spec.md
 _follow_wait_probe_all_timeout() {
     local top_job_name="$1"
     local timeout_secs="$2"
-    local baselines
-    baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    local raw_baselines in_progress_branches baselines
+    raw_baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    in_progress_branches=$(echo "$raw_baselines" | jq -r '[to_entries[] | select(.value.building == true) | .key] | join(" ")')
+    baselines=$(_normalize_probe_all_baselines "$raw_baselines")
 
     log_info "Waiting for Jenkins build ${top_job_name} (any branch) to start..."
 
     local deadline=$(( $(date +%s) + timeout_secs ))
 
     while true; do
-        sleep "$POLL_INTERVAL"
-
-        local current detected
-        current=$(_fetch_multibranch_baselines "$top_job_name")
+        local raw_current current detected
+        raw_current=$(_fetch_multibranch_baselines "$top_job_name")
+        current=$(_flatten_probe_all_baselines "$raw_current")
         detected=$(_detect_probe_all_candidate "$baselines" "$current")
 
         if [[ -n "$detected" ]]; then
             local branch build_number
             branch="${detected%% *}"
             build_number="${detected##* }"
-            log_info "Build detected on branch '${branch}' — following ${top_job_name}/${branch} #${build_number}"
+            if _branch_was_in_progress "$branch" "$in_progress_branches"; then
+                log_info "Build already in progress on branch '${branch}' — attaching to ${top_job_name}/${branch} #${build_number}"
+            else
+                log_info "Build detected on branch '${branch}' — following ${top_job_name}/${branch} #${build_number}"
+            fi
             echo "${branch} ${build_number}"
             return 0
         fi
@@ -640,6 +682,8 @@ _follow_wait_probe_all_timeout() {
         if [[ $now -ge $deadline ]]; then
             return 1
         fi
+
+        sleep "$POLL_INTERVAL"
     done
 }
 

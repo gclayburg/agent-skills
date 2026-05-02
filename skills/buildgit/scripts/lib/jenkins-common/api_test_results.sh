@@ -1108,19 +1108,22 @@ _indent_spaces() {
 _format_hierarchical_test_results_line() {
     local label="$1"
     local label_width="$2"
-    local total="$3"
-    local total_width="$4"
-    local passed="$5"
-    local passed_width="$6"
-    local failed="$7"
-    local failed_width="$8"
-    local skipped="$9"
-    local skipped_width="${10}"
+    local job_name="$3"
+    local job_width="$4"
+    local total="$5"
+    local total_width="$6"
+    local passed="$7"
+    local passed_width="$8"
+    local failed="$9"
+    local failed_width="${10}"
+    local skipped="${11}"
+    local skipped_width="${12}"
 
     local formatted_line=""
     printf -v formatted_line \
-        "%-*s  Total: %*s | Passed: %*s | Failed: %*s | Skipped: %*s" \
+        "%-*s  %-*s  %*s  %*s/%*s/%*s" \
         "$label_width" "$label" \
+        "$job_width" "$job_name" \
         "$total_width" "$total" \
         "$passed_width" "$passed" \
         "$failed_width" "$failed" \
@@ -1230,22 +1233,26 @@ display_hierarchical_test_results() {
     local count
     count=$(echo "$collected_json" | jq 'length')
 
-    local -a line_labels line_colors line_totals line_passed line_failed line_skipped
+    local -a line_labels line_jobs line_colors line_totals line_passed line_failed line_skipped
     local max_label_width=6
-    local max_total_width=${#total_sum}
+    local max_job_width=0
+    local max_total_width=5   # "Total" header word is 5 chars minimum
     local max_passed_width=${#passed_sum}
     local max_failed_width=${#failed_sum}
     local max_skipped_width=${#skipped_sum}
 
     local i=0
     while [[ "$i" -lt "$count" ]]; do
-        local stage_label depth test_json indent label summary total passed failed skipped line_color
+        local stage_label depth job build_number test_json indent label job_display summary total passed failed skipped line_color
 
         stage_label=$(echo "$collected_json" | jq -r ".[$i].stage // .[$i].job // empty")
         depth=$(echo "$collected_json" | jq -r ".[$i].depth // 0")
+        job=$(echo "$collected_json" | jq -r ".[$i].job // empty")
+        build_number=$(echo "$collected_json" | jq -r ".[$i].build_number // empty")
         test_json=$(echo "$collected_json" | jq -r ".[$i].test_json // empty")
         indent=$(_indent_spaces $((depth * 2)))
         label="${indent}${stage_label}"
+        job_display="${job} #${build_number}"
 
         if [[ -z "$test_json" ]]; then
             total="?"
@@ -1268,6 +1275,7 @@ display_hierarchical_test_results() {
         fi
 
         line_labels[$i]="$label"
+        line_jobs[$i]="$job_display"
         line_colors[$i]="$line_color"
         line_totals[$i]="$total"
         line_passed[$i]="$passed"
@@ -1276,6 +1284,9 @@ display_hierarchical_test_results() {
 
         if [[ "${#label}" -gt "$max_label_width" ]]; then
             max_label_width=${#label}
+        fi
+        if [[ "${#job_display}" -gt "$max_job_width" ]]; then
+            max_job_width=${#job_display}
         fi
         if [[ "${#total}" -gt "$max_total_width" ]]; then
             max_total_width=${#total}
@@ -1293,14 +1304,23 @@ display_hierarchical_test_results() {
         i=$((i + 1))
     done
 
+    # Header: right-align "Total" over the total column, then append P/F/S label
+    local header_padding
+    header_padding=$((max_label_width + 2 + max_job_width + 2 + max_total_width - 19))
+    if [[ "$header_padding" -lt 6 ]]; then
+        header_padding=6
+    fi
+    local header_line
+    printf -v header_line "=== Test Results ===%${header_padding}s  Passed/Failed/Skipped" "Total"
     echo ""
-    echo "${section_color}=== Test Results ===${COLOR_RESET}"
+    echo "${section_color}${header_line}${COLOR_RESET}"
 
     i=0
     while [[ "$i" -lt "$count" ]]; do
         local rendered_line
         rendered_line=$(_format_hierarchical_test_results_line \
             "${line_labels[$i]}" "$max_label_width" \
+            "${line_jobs[$i]}" "$max_job_width" \
             "${line_totals[$i]}" "$max_total_width" \
             "${line_passed[$i]}" "$max_passed_width" \
             "${line_failed[$i]}" "$max_failed_width" \
@@ -1319,6 +1339,7 @@ display_hierarchical_test_results() {
     local totals_line
     totals_line=$(_format_hierarchical_test_results_line \
         "Totals" "$max_label_width" \
+        "" "$max_job_width" \
         "$total_sum" "$max_total_width" \
         "$passed_sum" "$max_passed_width" \
         "$failed_sum" "$max_failed_width" \

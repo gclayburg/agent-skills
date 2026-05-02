@@ -1039,6 +1039,119 @@ _handle_build_completion() {
     fi
 }
 
+_parse_push_hook_signal() {
+    local git_output="$1"
+    local line normalized started_build_number="" cancelled_item="" cancelled_why="" queued_url=""
+
+    while IFS= read -r line; do
+        normalized="$line"
+        if [[ "$normalized" =~ ^[[:space:]]*remote:[[:space:]]*(.*)$ ]]; then
+            normalized="${BASH_REMATCH[1]}"
+        else
+            normalized="${normalized#"${normalized%%[![:space:]]*}"}"
+        fi
+
+        if [[ "$normalized" =~ ^Build[[:space:]]+started:[[:space:]]+(https?://[^[:space:]]+)[[:space:]]*$ ]]; then
+            local build_url="${BASH_REMATCH[1]}"
+            if [[ "$build_url" =~ /([0-9]+)/?$ ]]; then
+                started_build_number="${BASH_REMATCH[1]}"
+            fi
+            continue
+        fi
+
+        if [[ "$normalized" =~ ^WARNING:[[:space:]]+Queue[[:space:]]+item[[:space:]]+([0-9]+)[[:space:]]+was[[:space:]]+CANCELLED(.*)$ ]]; then
+            cancelled_item="${BASH_REMATCH[1]}"
+            cancelled_why="${BASH_REMATCH[2]}"
+            cancelled_why="${cancelled_why#"${cancelled_why%%[![:space:]]*}"}"
+            continue
+        fi
+
+        if [[ "$normalized" =~ ^Build[[:space:]]+queued:[[:space:]]+(https?://[^[:space:]]*/queue/item/[0-9]+/?)[[:space:]]*$ ]]; then
+            queued_url="${BASH_REMATCH[1]}"
+        fi
+    done <<< "$git_output"
+
+    if [[ -n "$started_build_number" ]]; then
+        echo "started:${started_build_number}"
+    elif [[ -n "$cancelled_item" ]]; then
+        echo "cancelled:${cancelled_item}:${cancelled_why}"
+    elif [[ -n "$queued_url" ]]; then
+        echo "queued:${queued_url}"
+    fi
+}
+
+_emit_push_queue_timeout_diagnostics() {
+    local job_name="$1"
+    local baseline_build="$2"
+    local queue_url="$3"
+    local last_build queue_path queue_response http_code queue_body queue_status="network error"
+    local cancelled="" why="" executable_number=""
+
+    bg_log_error "Post-receive hook queue diagnostics:"
+    echo "  Job polled: ${job_name}" >&2
+    echo "  Baseline build: #${baseline_build}" >&2
+
+    last_build=$(get_last_build_number "$job_name" 2>/dev/null) || last_build="unknown"
+    [[ -n "$last_build" ]] || last_build="unknown"
+    echo "  Observed lastBuild.number: ${last_build}" >&2
+
+    queue_path=$(_queue_item_path_from_url "$queue_url")
+    if [[ -n "$queue_path" ]]; then
+        if queue_response=$(jenkins_api_with_status "$queue_path" 2>&1); then
+            :
+        else
+            :
+        fi
+        if [[ "$queue_response" == *$'\n'* ]]; then
+            http_code="${queue_response##*$'\n'}"
+            queue_body="${queue_response%$'\n'*}"
+        else
+            http_code="$queue_response"
+            queue_body=""
+        fi
+
+        if [[ "$http_code" == "200" ]]; then
+            queue_status="200 OK"
+        elif [[ "$http_code" =~ ^[0-9][0-9][0-9]$ && "$http_code" != "000" ]]; then
+            local body_snippet
+            body_snippet=$(printf '%s' "$queue_body" | tr '\n' ' ')
+            body_snippet="${body_snippet:0:200}"
+            queue_status="HTTP ${http_code}"
+            if [[ -n "$body_snippet" ]]; then
+                queue_status="${queue_status}: ${body_snippet}"
+            fi
+        else
+            queue_status="network error"
+            if [[ -n "$queue_response" ]]; then
+                local error_snippet
+                error_snippet=$(printf '%s' "$queue_response" | tr '\n' ' ')
+                error_snippet="${error_snippet:0:200}"
+                queue_status="${queue_status}: ${error_snippet}"
+            fi
+        fi
+
+        if [[ -n "$queue_body" ]]; then
+            cancelled=$(printf '%s' "$queue_body" | jq -r '.cancelled // empty' 2>/dev/null) || cancelled=""
+            why=$(printf '%s' "$queue_body" | jq -r '.why // empty' 2>/dev/null) || why=""
+            executable_number=$(printf '%s' "$queue_body" | jq -r '.executable.number // empty' 2>/dev/null) || executable_number=""
+        fi
+        if [[ -z "$cancelled" ]]; then
+            cancelled=$(printf '%s' "$queue_response" | grep -o '"cancelled":[^,}]*' | head -n 1 | cut -d: -f2 | tr -d ' "') || cancelled=""
+        fi
+        if [[ -z "$why" ]]; then
+            why=$(printf '%s' "$queue_response" | grep -o '"why":"[^"]*"' | head -n 1 | cut -d'"' -f4) || why=""
+        fi
+        if [[ -z "$executable_number" ]]; then
+            executable_number=$(printf '%s' "$queue_response" | grep -o '"number":[0-9]*' | head -n 1 | cut -d: -f2) || executable_number=""
+        fi
+    fi
+
+    echo "  Queue item probe: ${queue_status}" >&2
+    echo "  Queue cancelled: ${cancelled:-unknown}" >&2
+    echo "  Queue why: ${why:-unknown}" >&2
+    echo "  Queue executable.number: ${executable_number:-unknown}" >&2
+}
+
 cmd_push() {
     # Parse push-specific options
     _parse_push_options "$@"
@@ -1095,8 +1208,70 @@ cmd_push() {
     baseline_build=$(get_last_build_number "$job_name")
     bg_log_info "Current build baseline: #${baseline_build}"
 
+    local hook_signal hook_kind hook_value hook_detail queue_url=""
+    hook_signal=$(_parse_push_hook_signal "$git_output")
+    hook_kind="${hook_signal%%:*}"
+    hook_value="${hook_signal#*:}"
+
+    if [[ "$hook_kind" == "started" && "$hook_signal" != "$hook_kind" ]]; then
+        local new_build_number="$hook_value"
+        baseline_build=$((new_build_number - 1))
+        bg_log_progress "Build #${new_build_number} already started (reported by post-receive hook)"
+        _display_monitoring_preamble "$job_name" "$PUSH_PRIOR_JOBS" "false" "$baseline_build"
+        log_info "Starting"
+
+        if [[ "$PUSH_LINE_MODE" == "true" ]]; then
+            if _monitor_build_line_mode "$job_name" "$new_build_number" "false" "true"; then
+                return 0
+            fi
+            return 1
+        fi
+
+        local push_commit_info push_commit_sha push_commit_msg push_correlation_status
+        push_commit_info=$(_get_local_head_commit_context)
+        push_commit_sha=$(echo "$push_commit_info" | head -1)
+        push_commit_msg=$(echo "$push_commit_info" | tail -1)
+        push_correlation_status=$(correlate_commit "$push_commit_sha")
+
+        _display_build_in_progress_banner "$job_name" "$new_build_number" "" \
+            "$push_commit_sha" "$push_commit_msg" "$push_correlation_status"
+
+        if ! _monitor_build "$job_name" "$new_build_number" "true" "true"; then
+            bg_log_error "Build monitoring interrupted or timed out"
+            local console_url
+            console_url=$(jenkins_console_url "$job_name" "$new_build_number")
+            if [[ -n "$console_url" ]]; then
+                bg_log_essential "Suggestion: Check Jenkins console at ${console_url}"
+            fi
+            return 1
+        fi
+
+        echo ""
+        _handle_build_completion "$job_name" "$new_build_number"
+        return $?
+    fi
+
+    if [[ "$hook_kind" == "cancelled" && "$hook_signal" != "$hook_kind" ]]; then
+        hook_value="${hook_signal#cancelled:}"
+        hook_detail="${hook_value#*:}"
+        hook_value="${hook_value%%:*}"
+        if [[ -n "$hook_detail" && "$hook_detail" != "$hook_value" ]]; then
+            bg_log_error "Jenkins queue item ${hook_value} was cancelled by the post-receive hook (${hook_detail})"
+        else
+            bg_log_error "Jenkins queue item ${hook_value} was cancelled by the post-receive hook"
+        fi
+        return 1
+    fi
+
+    if [[ "$hook_kind" == "queued" && "$hook_signal" != "$hook_kind" ]]; then
+        queue_url="$hook_value"
+    fi
+
     # Wait for new build to start
-    if ! _wait_for_build_start "$job_name" "$baseline_build" ""; then
+    if ! _wait_for_build_start "$job_name" "$baseline_build" "$queue_url"; then
+        if [[ -n "$queue_url" ]]; then
+            _emit_push_queue_timeout_diagnostics "$job_name" "$baseline_build" "$queue_url" || true
+        fi
         bg_log_success "Git push completed successfully"
         bg_log_error "Jenkins build monitoring failed - no build started"
         bg_log_essential "Suggestion: Check Jenkins webhook/SCM polling configuration"
