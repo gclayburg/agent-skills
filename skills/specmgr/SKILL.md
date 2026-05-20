@@ -139,13 +139,33 @@ The SPEC Workflow block embedded in plans must use generic language:
 #### Create Implementation log 
 
 All implementations will have an implementation log that is modifed as needed during implementation. Guidelines:
-1. after implementation: summarize files changed, key decisions, and anything notable learned during implementation
-2. Count compaction events (system-reminder summarizing prior conversation) that occured during implementation.  If unknown, use 0.
-3. Record list of skills invoked with `Skill` tool during implementation, or `NONE`.
+1. **Implementer self-identification (REQUIRED).** The first line of every `#### Implementation Log` (whether at the bottom of a non-chunked spec or in a chunk's subsection) MUST be:
+
+   `- **Implementer:** {Tool} {model}`
+
+   The agent fills this in itself, using the `{Tool} {model}` free-form convention. Examples: `Claude Opus 4.7`, `Cursor composer-2.5`, `Codex GPT-5`. Use whatever the running agent's system prompt identifies the tool and model as. This is how the workreview skill knows who actually wrote each chunk — without this field, the review report cannot accurately attribute work.
+2. after implementation: summarize files changed, key decisions, and anything notable learned during implementation
+3. Count compaction events (system-reminder summarizing prior conversation) that occured during implementation.  If unknown, use 0.
+4. Record list of skills invoked with `Skill` tool during implementation, or `NONE`.
 
 Location of Implementation log: 
 - If implementing a DRAFT Spec not chunked, The implementation log should be created in a new section `#### Implementation Log` at the bottom of the spec file
 - If implementing a spec with a chunkplan, the chunk plan file is the live log destination during implementation — each chunk's notes go into its own `#### Implementation Log` subsection in the chunk plan
+
+#### Implementer attribution in commits
+
+In addition to the `**Implementer:**` field in the Implementation Log, every commit that implements spec code (commit messages starting with `impl spec:` or `chunk N/T:`) MUST include a `Co-Authored-By:` trailer naming the implementing agent. Format:
+
+```
+Co-Authored-By: {Tool} {model} <noreply@{tool-domain}>
+```
+
+Examples:
+- `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>`
+- `Co-Authored-By: Cursor composer-2.5 <noreply@cursor.com>`
+- `Co-Authored-By: Codex GPT-5 <noreply@openai.com>`
+
+This belt-and-suspenders approach (log field + commit trailer) means agent attribution survives even when the impl log is missing, and workreview can cross-check the two sources.
 
 #### Existing test modification policy
 

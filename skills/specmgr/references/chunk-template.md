@@ -66,10 +66,16 @@ See spec [<Section Name>](./<spec-filename>.md#<anchor>) sections X.X-X.X.
 #### Implementation Log
 
 <!-- Filled in by the implementing agent after completing this chunk.
-     Required fields:
+     Required fields (in this order):
+     - **Implementer:** {Tool} {model} — REQUIRED first line. Free-form `{Tool} {model}`,
+       e.g. "Claude Opus 4.7", "Cursor composer-2.5", "Codex GPT-5". The agent self-identifies
+       using whatever its system prompt says. workreview uses this to attribute the chunk
+       in the review report.
      - Files changed, key decisions, anything the finalize step needs to know
      - Compaction events during this chunk: N (count of system-reminder compaction events observed during this chunk's agent run)
-     - Skills used during this chunk: list of skills invoked via the Skill tool, or "None" -->
+     - Skills used during this chunk: list of skills invoked via the Skill tool, or "None"
+     Also: the chunk's commit MUST include a `Co-Authored-By: {Tool} {model} <noreply@{tool-domain}>`
+     trailer so agent attribution survives even if this log is missing. -->
 ```
 
 ---

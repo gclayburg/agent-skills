@@ -97,6 +97,32 @@ For every spec identified by the "Specs implemented" detection, locate its `####
 
 The Implementation Log is where specmgr already stores: existing-test-modification rows, compaction counts, skills used, CI/CD verification notes, key decisions, and any Spec-Backing-None flagged decisions. workreview does NOT duplicate these into top-level report sections — it embeds the Implementation Log verbatim and lets the reviewer read them in context.
 
+### Implementer aggregation rules
+
+The `**Implementer:**` header field at the top of the report is derived from the `**Implementer:**` line that specmgr requires as the first bullet of every `#### Implementation Log`. Apply these rules in order:
+
+1. **Non-chunked spec:** read the single `**Implementer:**` line from the spec file's `#### Implementation Log` and use it verbatim.
+
+2. **Chunked spec with a single implementer:** if every chunk's `#### Implementation Log` reports the same `**Implementer:**` value, list it once with no chunk attribution. Example:
+
+   ```
+   **Implementer:** Cursor composer-2.5
+   ```
+
+3. **Chunked spec with multiple implementers:** if chunks were implemented by different agents, use the inline-per-chunk format, comma-separated, in chunk-number order. Group contiguous chunks done by the same agent into a range. Example:
+
+   ```
+   **Implementer:** Cursor composer-2.5 (chunks 1–2), Claude Opus 4.7 (chunk 3)
+   ```
+
+4. **Missing Implementer field:** if any chunk's impl log lacks the `**Implementer:**` line, fall back to the `Co-Authored-By:` trailer of that chunk's commit (specmgr requires this trailer on every `chunk N/T:` or `impl spec:` commit). If both are missing, write `unknown` for that chunk and add a one-line note under that spec's subsection in `## Implementation Logs` flagging the omission.
+
+5. **Cross-check log vs. trailer:** if the impl log's `**Implementer:**` value and the commit's `Co-Authored-By:` trailer disagree for the same chunk, prefer the impl log value but record the discrepancy in the Implementation Logs section so the reviewer can resolve it.
+
+### Work Reviewer
+
+The `**Work Reviewer:**` header field is the `{Tool} {model}` of the agent running this workreview skill — fill it in using whatever the running agent's own system prompt identifies the tool and model as (e.g. `Claude Opus 4.7`, `Cursor composer-2.5`, `Codex GPT-5`). This field is always present in both Mode A and Mode B reports; it documents who generated the review artifact (distinct from who wrote the implementation code).
+
 ### Git commits and build status
 
 Invoke buildgit to produce a verbatim git-log-with-build-status section:
@@ -128,7 +154,8 @@ This single template is used for both Mode A and Mode B. Only the title, filenam
 **Range:** `{resolved git range, or "all commits" if on main/master with no range}`
 **Branch:** `{branch}`
 **Generated:** `{ISO 8601 date-time, America/Denver}`
-**Implementer:** `{agent or human}` (Mode A only; omit for Mode B)
+**Implementer:** `{derived from Implementation Logs — see Implementer aggregation rules below}` (Mode A only; omit for Mode B)
+**Work Reviewer:** `{Tool} {model} of the agent running this workreview skill — e.g. "Claude Opus 4.7", "Cursor composer-2.5", "Codex GPT-5"}`
 
 ## Summary
 
@@ -228,10 +255,12 @@ Steps:
 6. **For each implemented spec, locate and read its `#### Implementation Log`:**
    - Non-chunked: from the bottom of the spec file.
    - Chunked: from every chunk's `#### Implementation Log` in the chunk plan referenced by the spec's `Chunkplan:` field.
-7. **Run `buildgit status --gitlog[={range}]`** and capture its output verbatim.
-8. **Derive `## Files Changed` and `## Files Created`** from `git diff --name-status {range}`.
-9. **Write the `## Consolidated Summary`** as a brief reviewer-facing rollup — do not duplicate metric data from the embedded Implementation Logs.
-10. **Write the `## Key Highlights`** section for cross-cutting items not covered in any single Implementation Log.
-11. **Write the report file** to the resolved output path.
+7. **Derive the `**Implementer:**` header field** by applying the **Implementer aggregation rules** above to the `**Implementer:**` line(s) extracted from the impl log(s). If any log is missing the field, fall back to that chunk's commit `Co-Authored-By:` trailer; if both are missing, write `unknown` and flag it.
+8. **Fill in the `**Work Reviewer:**` header field** using the `{Tool} {model}` of the agent running this skill (e.g. `Claude Opus 4.7`). Do not copy from the implementer — these are two distinct roles.
+9. **Run `buildgit status --gitlog[={range}]`** and capture its output verbatim.
+10. **Derive `## Files Changed` and `## Files Created`** from `git diff --name-status {range}`.
+11. **Write the `## Consolidated Summary`** as a brief reviewer-facing rollup — do not duplicate metric data from the embedded Implementation Logs.
+12. **Write the `## Key Highlights`** section for cross-cutting items not covered in any single Implementation Log.
+13. **Write the report file** to the resolved output path.
 
 If specmgr's `#### Implementation Log` content is missing or incomplete for a spec in the range, note it explicitly in the report under that spec's subsection (e.g. "Implementation Log not found — spec was marked IMPLEMENTED but no log is present"). Do not fabricate log content.
