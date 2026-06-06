@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-BUILDGIT_VERSION="1.4.0-dev"
+BUILDGIT_VERSION="1.4.1-dev"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/jenkins-common.sh"

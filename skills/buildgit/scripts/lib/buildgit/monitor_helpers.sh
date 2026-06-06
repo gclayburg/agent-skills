@@ -145,18 +145,25 @@ __buildgit_monitor_build_impl() {
 
         if [[ -z "$build_info" ]]; then
             consecutive_failures=$((consecutive_failures + 1))
-            if [[ "$showed_progress" == "true" ]]; then
-                _clear_follow_line_progress
-                showed_progress=false
-            fi
             if [[ $consecutive_failures -ge 5 ]]; then
+                if [[ "$showed_progress" == "true" ]]; then
+                    _clear_follow_line_progress_final
+                    showed_progress=false
+                fi
                 rm -f "$stage_log_file" 2>/dev/null || true
                 rm -f "$stage_state_file" 2>/dev/null || true
                 rm -f "$deferred_log_file" 2>/dev/null || true
                 bg_log_error "Too many consecutive API failures ($consecutive_failures)"
                 return 1
             fi
-            bg_log_warning "API request failed, retrying... ($consecutive_failures/5)"
+            if [[ "$showed_progress" == "true" ]]; then
+                _print_above_follow_line_progress "$(log_warning "API request failed, retrying... ($consecutive_failures/5)")"
+                if [[ "${_PROGRESS_BAR_LINE_COUNT:-0}" -le 0 ]]; then
+                    showed_progress=false
+                fi
+            else
+                bg_log_warning "API request failed, retrying... ($consecutive_failures/5)"
+            fi
             local iter_end iter_cost sleep_secs
             iter_end=$(date +%s)
             iter_cost=$((iter_end - iter_start))
@@ -203,7 +210,7 @@ __buildgit_monitor_build_impl() {
         # Spec: monitor-poll-latency-spec.md § 3
         if [[ "$building" == "false" && -n "$result" ]]; then
             if [[ "$showed_progress" == "true" ]]; then
-                _clear_follow_line_progress
+                _clear_follow_line_progress_final
                 showed_progress=false
             fi
             _buildgit_iter_cache_end
@@ -372,8 +379,29 @@ __buildgit_monitor_build_impl() {
 
         if [[ "$showed_progress" == "true" ]]; then
             if [[ -n "$deferred_output" || -n "$stage_output" || "$emit_verbose_progress" == "true" ]]; then
-                _clear_follow_line_progress
-                showed_progress=false
+                local permanent_output=""
+                if [[ -n "$deferred_output" ]]; then
+                    permanent_output+="$deferred_output"
+                fi
+                if [[ -n "$stage_output" ]]; then
+                    if [[ -n "$permanent_output" ]]; then
+                        permanent_output+=$'\n'
+                    fi
+                    permanent_output+="$stage_output"
+                fi
+                if [[ "$emit_verbose_progress" == "true" ]]; then
+                    if [[ -n "$permanent_output" ]]; then
+                        permanent_output+=$'\n'
+                    fi
+                    permanent_output+="$(log_info "Build in progress... (${elapsed}s elapsed)")"
+                fi
+                _print_above_follow_line_progress "$permanent_output"
+                if [[ "${_PROGRESS_BAR_LINE_COUNT:-0}" -le 0 ]]; then
+                    showed_progress=false
+                fi
+                deferred_output=""
+                stage_output=""
+                emit_verbose_progress=false
             fi
         fi
 
@@ -422,7 +450,7 @@ __buildgit_monitor_build_impl() {
     done
 
     if [[ "$showed_progress" == "true" ]]; then
-        _clear_follow_line_progress
+        _clear_follow_line_progress_final
         echo ""
     fi
     _buildgit_iter_cache_end

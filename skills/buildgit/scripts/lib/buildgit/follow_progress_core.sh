@@ -1,6 +1,9 @@
 # Checks whether status line follow mode should render interactive output.
 # BUILDGIT_FORCE_TTY=1 is test-only and allows deterministic TTY-path tests.
 _status_stdout_is_tty() {
+    if [[ "${BUILDGIT_FORCE_NOT_TTY:-}" == "1" ]]; then
+        return 1
+    fi
     if [[ "${BUILDGIT_FORCE_TTY:-}" == "1" ]]; then
         return 0
     fi
@@ -943,6 +946,83 @@ _redraw_follow_line_progress_lines() {
 
     printf '%b' "$payload"
     _PROGRESS_BAR_LINE_COUNT="$new_count"
+    _FOLLOW_PROGRESS_CACHED_LINES=("${new_lines[@]}")
+    _FOLLOW_PROGRESS_CACHED_LINE_COUNT="$new_count"
+    _FOLLOW_PROGRESS_CACHE_VALID=true
+}
+
+_build_follow_line_clear_payload() {
+    local old_count="${1:-0}"
+    if [[ "$old_count" -le 0 ]]; then
+        return 0
+    fi
+
+    local payload=$'\r'
+    if [[ "$old_count" -gt 1 ]]; then
+        payload+=$(printf '\033[%sA' "$((old_count - 1))")
+    fi
+
+    local idx
+    for ((idx=0; idx<old_count; idx++)); do
+        payload+=$'\033[K'
+        if [[ "$idx" -lt $((old_count - 1)) ]]; then
+            payload+=$'\n'
+        fi
+    done
+
+    if [[ "$old_count" -gt 1 ]]; then
+        payload+=$(printf '\033[%sA' "$((old_count - 1))")
+    fi
+    printf '%b' "$payload"
+}
+
+_append_follow_line_rows_payload() {
+    local lines=("$@")
+    local count="${#lines[@]}"
+    local idx
+    for ((idx=0; idx<count; idx++)); do
+        printf '%b' $'\033[K'
+        printf '%s' "${lines[$idx]}"
+        if [[ "$idx" -lt $((count - 1)) ]]; then
+            printf '\n'
+        fi
+    done
+}
+
+_forget_follow_line_progress_cache() {
+    _FOLLOW_PROGRESS_CACHED_LINES=()
+    _FOLLOW_PROGRESS_CACHED_LINE_COUNT=0
+    _FOLLOW_PROGRESS_CACHE_VALID=false
+}
+
+_print_above_follow_line_progress() {
+    local output="$1"
+    if [[ -z "$output" ]]; then
+        return 0
+    fi
+
+    local old_count="${_PROGRESS_BAR_LINE_COUNT:-0}"
+    if [[ "$old_count" -le 0 ]] || ! _status_stdout_is_tty; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+
+    local restore_cached=false
+    if [[ "$THREADS_MODE" == "true" && "${_FOLLOW_PROGRESS_CACHE_VALID:-false}" == "true" && "${_FOLLOW_PROGRESS_CACHED_LINE_COUNT:-0}" -gt 0 ]]; then
+        restore_cached=true
+    fi
+
+    local payload=""
+    payload+="$(_build_follow_line_clear_payload "$old_count")"
+    payload+="$output"$'\n'
+    if [[ "$restore_cached" == "true" ]]; then
+        payload+="$(_append_follow_line_rows_payload "${_FOLLOW_PROGRESS_CACHED_LINES[@]}")"
+        _PROGRESS_BAR_LINE_COUNT="${_FOLLOW_PROGRESS_CACHED_LINE_COUNT:-0}"
+    else
+        _PROGRESS_BAR_LINE_COUNT=0
+    fi
+
+    printf '%b' "$payload"
 }
 
 _display_follow_line_progress() {
@@ -1018,24 +1098,13 @@ _clear_follow_line_progress() {
         return 0
     fi
 
-    local payload=$'\r'
-    if [[ "$old_count" -gt 1 ]]; then
-        payload+=$(printf '\033[%sA' "$((old_count - 1))")
-    fi
-
-    local idx
-    for ((idx=0; idx<old_count; idx++)); do
-        payload+=$'\033[K'
-        if [[ "$idx" -lt $((old_count - 1)) ]]; then
-            payload+=$'\n'
-        fi
-    done
-
-    if [[ "$old_count" -gt 1 ]]; then
-        payload+=$(printf '\033[%sA' "$((old_count - 1))")
-    fi
-    printf '%b' "$payload"
+    _build_follow_line_clear_payload "$old_count"
     _PROGRESS_BAR_LINE_COUNT=0
+}
+
+_clear_follow_line_progress_final() {
+    _clear_follow_line_progress
+    _forget_follow_line_progress_cache
 }
 
 # Compact line-mode monitor for in-progress builds.
@@ -1094,7 +1163,7 @@ _monitor_build_line_mode() {
 
     if [[ "${building:-true}" == "true" ]]; then
         if [[ "$showed_progress" == "true" ]]; then
-            _clear_follow_line_progress
+            _clear_follow_line_progress_final
             echo ""
         fi
         bg_log_error "Build #${build_number} did not complete within ${MAX_BUILD_TIME}s timeout"
@@ -1102,7 +1171,7 @@ _monitor_build_line_mode() {
     fi
 
     if [[ "$showed_progress" == "true" ]]; then
-        _clear_follow_line_progress
+        _clear_follow_line_progress_final
     fi
 
     _status_line_for_build_json "$job_name" "$build_number" "$build_json" "$no_tests"

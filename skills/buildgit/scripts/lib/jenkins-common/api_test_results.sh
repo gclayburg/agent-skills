@@ -983,6 +983,91 @@ _find_downstream_stage_label() {
     fi
 }
 
+# Merge two JSON arrays without passing payloads on the command line (ARG_MAX safe).
+# Usage: _jq_merge_json_arrays "$left" "$right"
+# Prints merged compact JSON array on stdout.
+_jq_merge_json_arrays() {
+    local left="${1:-[]}"
+    local right="${2:-[]}"
+
+    if [[ -z "$left" || "$left" == "null" ]]; then
+        left='[]'
+    fi
+    if [[ -z "$right" || "$right" == "null" ]]; then
+        right='[]'
+    fi
+
+    if [[ "$left" == "[]" ]]; then
+        printf '%s' "$right"
+        return 0
+    fi
+    if [[ "$right" == "[]" ]]; then
+        printf '%s' "$left"
+        return 0
+    fi
+
+    { printf '%s' "$left"; printf '%s' "$right"; } | jq -c -s 'add'
+}
+
+# Build a JSON object with two large JSON-valued fields (ARG_MAX safe).
+# Usage: _jq_object_with_json_fields total passed failed skipped failed_tests_json breakdown_json
+# Prints compact JSON object on stdout.
+_jq_object_with_json_fields() {
+    local total="$1" passed="$2" failed="$3" skipped="$4"
+    local failed_tests_json="$5" breakdown_json="$6"
+    local failed_file breakdown_file
+
+    failed_file=$(mktemp "${TMPDIR:-/tmp}/buildgit-failed.XXXXXX")
+    breakdown_file=$(mktemp "${TMPDIR:-/tmp}/buildgit-breakdown.XXXXXX")
+    printf '%s' "${failed_tests_json:-[]}" > "$failed_file"
+    printf '%s' "${breakdown_json:-[]}" > "$breakdown_file"
+
+    jq -cn \
+        --argjson total "$total" \
+        --argjson passed "$passed" \
+        --argjson failed "$failed" \
+        --argjson skipped "$skipped" \
+        --slurpfile failed_tests "$failed_file" \
+        --slurpfile breakdown "$breakdown_file" \
+        '{
+            total: $total,
+            passed: $passed,
+            failed: $failed,
+            skipped: $skipped,
+            failed_tests: $failed_tests[0],
+            breakdown: $breakdown[0]
+        }'
+
+    rm -f "$failed_file" "$breakdown_file"
+}
+
+# Build test-results JSON with a large failed_tests array (ARG_MAX safe).
+# Usage: _jq_test_results_object total passed failed skipped failed_tests_json
+_jq_test_results_object() {
+    local total="$1" passed="$2" failed="$3" skipped="$4"
+    local failed_tests_json="$5"
+    local failed_file
+
+    failed_file=$(mktemp "${TMPDIR:-/tmp}/buildgit-failed.XXXXXX")
+    printf '%s' "${failed_tests_json:-[]}" > "$failed_file"
+
+    jq -cn \
+        --argjson total "$total" \
+        --argjson passed "$passed" \
+        --argjson failed "$failed" \
+        --argjson skipped "$skipped" \
+        --slurpfile failed_tests "$failed_file" \
+        '{
+            total: $total,
+            passed: $passed,
+            failed: $failed,
+            skipped: $skipped,
+            failed_tests: $failed_tests[0]
+        }'
+
+    rm -f "$failed_file"
+}
+
 _collect_downstream_test_results_recursive() {
     local job_name="$1"
     local build_number="$2"
@@ -1042,10 +1127,7 @@ _collect_downstream_test_results_recursive() {
             "$downstream_stage" \
             "false")
 
-        collected_json=$(jq -c \
-            --argjson current "$collected_json" \
-            --argjson child "$child_json" \
-            '$current + $child' <<< '{}')
+        collected_json=$(_jq_merge_json_arrays "$collected_json" "$child_json")
     done <<< "$downstream_lines"
 
     echo "$collected_json"
@@ -1354,10 +1436,7 @@ display_hierarchical_test_results() {
             local test_json failed_tests
             test_json=$(echo "$collected_json" | jq -r ".[$i].test_json // empty")
             failed_tests=$(parse_failed_tests "$test_json")
-            aggregated_failed_tests=$(jq -cn \
-                --argjson current "$aggregated_failed_tests" \
-                --argjson additional "$failed_tests" \
-                '$current + $additional')
+            aggregated_failed_tests=$(_jq_merge_json_arrays "$aggregated_failed_tests" "$failed_tests")
             total_failures=$((total_failures + line_failed[$i]))
         fi
         i=$((i + 1))
@@ -1625,19 +1704,7 @@ format_test_results_json() {
     ')
 
     # Build the final JSON object
-    jq -n \
-        --argjson total "$total" \
-        --argjson passed "$passed" \
-        --argjson failed "$failed" \
-        --argjson skipped "$skipped" \
-        --argjson failed_tests "$transformed_failed_tests" \
-        '{
-            total: $total,
-            passed: $passed,
-            failed: $failed,
-            skipped: $skipped,
-            failed_tests: $failed_tests
-        }'
+    _jq_test_results_object "$total" "$passed" "$failed" "$skipped" "$transformed_failed_tests"
 }
 
 # Format collected parent/downstream test results as JSON.
@@ -1670,10 +1737,7 @@ format_hierarchical_test_results_json() {
         test_json=$(echo "$collected_json" | jq -r ".[$i].test_json // empty")
         if [[ -n "$test_json" ]]; then
             failed_tests=$(parse_failed_tests "$test_json")
-            aggregated_failed_tests=$(jq -cn \
-                --argjson current "$aggregated_failed_tests" \
-                --argjson additional "$failed_tests" \
-                '$current + $additional')
+            aggregated_failed_tests=$(_jq_merge_json_arrays "$aggregated_failed_tests" "$failed_tests")
         fi
         i=$((i + 1))
     done
@@ -1759,21 +1823,9 @@ format_hierarchical_test_results_json() {
         )
     ')
 
-    jq -n \
-        --argjson total "$total_sum" \
-        --argjson passed "$passed_sum" \
-        --argjson failed "$failed_sum" \
-        --argjson skipped "$skipped_sum" \
-        --argjson failed_tests "$transformed_failed_tests" \
-        --argjson breakdown "$breakdown_json" \
-        '{
-            total: $total,
-            passed: $passed,
-            failed: $failed,
-            skipped: $skipped,
-            failed_tests: $failed_tests,
-            breakdown: $breakdown
-        }'
+    _jq_object_with_json_fields \
+        "$total_sum" "$passed_sum" "$failed_sum" "$skipped_sum" \
+        "$transformed_failed_tests" "$breakdown_json"
 }
 
 # =============================================================================
