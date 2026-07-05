@@ -244,6 +244,8 @@ __buildgit_monitor_build_impl() {
             local settle_elapsed=0
             local stable_polls=0
             local settle_iterations=0
+            local verified_exit=false
+            local settle_flush_count=0
             local prev_state_fingerprint
             prev_state_fingerprint=$(_stage_state_settle_fingerprint "$stage_state")
             local tracking_complete
@@ -257,6 +259,23 @@ __buildgit_monitor_build_impl() {
             # OR complete; the prior code used OR here, which required BOTH
             # and made the loop hit MONITOR_SETTLE_MAX_SECONDS on every
             # monorepo build where tracking_complete never flipped to true.
+            #
+            # Flush-verified early exit (monitor-exit-latency-spec.md § 2):
+            # tracking_complete can never flip to true from tracker passes
+            # alone — wrapper/branch-summary rows are deferred and only
+            # printed by _force_flush_completion_stages. So on the first
+            # stable, print-quiescent fingerprint window, run the flush
+            # immediately (fresh cache window = independent second API
+            # sample). If the flush's state agrees with the tracker sample
+            # AND reports tracking_complete=true, exit now instead of
+            # waiting out MONITOR_SETTLE_STABLE_POLLS. Any disagreement
+            # falls back to the stable-polls/time caps exactly as before.
+            # Print-quiescence is required: the tracker prints parallel
+            # rows enriched (resolved ║N paths, matured agents behind the
+            # readiness gates) while the flush prints raw entries; letting
+            # the flush preempt a still-printing tracker emits raw rows
+            # (no [agent]/║N) and marks them printed forever — seen as an
+            # integration_tests.bats structure failure on CI.
             while [[ $settle_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && $stable_polls -lt $MONITOR_SETTLE_STABLE_POLLS && "$tracking_complete" != "true" ]]; do
                 sleep 1
                 local settle_iteration_start settle_iteration_end settle_iteration_cost
@@ -269,74 +288,112 @@ __buildgit_monitor_build_impl() {
                 stage_state=$(cat "$stage_state_file")
                 settle_stage_output=$(cat "$settle_tmp_log")
                 : > "$settle_tmp_log"
+                local tracker_print_quiescent=true
                 if [[ -n "$settle_stage_output" ]]; then
                     printf '%s\n' "$settle_stage_output"
+                    tracker_print_quiescent=false
+                fi
+                _buildgit_iter_cache_end
+                local current_state_fingerprint
+                current_state_fingerprint=$(_stage_state_settle_fingerprint "$stage_state")
+                tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
+                if [[ "$tracker_print_quiescent" != "true" ]]; then
+                    # Tracker is still emitting enriched rows — treat as
+                    # instability regardless of the API fingerprint.
+                    stable_polls=0
+                    prev_state_fingerprint="$current_state_fingerprint"
+                elif [[ "$current_state_fingerprint" == "$prev_state_fingerprint" && "$tracking_complete" != "true" ]]; then
+                    # Stable window observed — attempt the verified exit.
+                    settle_flush_count=$((settle_flush_count + 1))
+                    _buildgit_iter_cache_begin
+                    BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>"$settle_tmp_log" >"$stage_state_file"
+                    stage_state=$(cat "$stage_state_file")
+                    settle_stage_output=$(cat "$settle_tmp_log")
+                    : > "$settle_tmp_log"
+                    if [[ -n "$settle_stage_output" ]]; then
+                        printf '%s\n' "$settle_stage_output"
+                    fi
+                    _buildgit_iter_cache_end
+                    local flush_fingerprint
+                    flush_fingerprint=$(_stage_state_settle_fingerprint "$stage_state")
+                    tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
+                    if [[ "$flush_fingerprint" == "$current_state_fingerprint" ]]; then
+                        if [[ "$tracking_complete" == "true" ]]; then
+                            verified_exit=true
+                        fi
+                        stable_polls=$((stable_polls + 1))
+                    else
+                        stable_polls=0
+                        prev_state_fingerprint="$flush_fingerprint"
+                    fi
+                else
+                    stable_polls=0
+                    prev_state_fingerprint="$current_state_fingerprint"
                 fi
                 if [[ -z "$stage_log_file" ]]; then
                     rm -f "$settle_tmp_log" 2>/dev/null || true
                 fi
-                _buildgit_iter_cache_end
                 settle_iteration_end=$(date +%s)
                 settle_iteration_cost=$((settle_iteration_end - settle_iteration_start + 1))
                 if [[ "$settle_iteration_cost" -lt 1 ]]; then
                     settle_iteration_cost=1
                 fi
-                local current_state_fingerprint
-                current_state_fingerprint=$(_stage_state_settle_fingerprint "$stage_state")
-                tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
-                if [[ "$current_state_fingerprint" == "$prev_state_fingerprint" ]]; then
-                    stable_polls=$((stable_polls + 1))
-                else
-                    stable_polls=0
-                    prev_state_fingerprint="$current_state_fingerprint"
-                fi
                 settle_elapsed=$((settle_elapsed + settle_iteration_cost))
                 settle_iterations=$((settle_iterations + 1))
             done
             if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
-                printf '[buildgit-settle] iterations=%d elapsed=%d stable_polls=%d tracking_complete=%s\n' \
-                    "$settle_iterations" "$settle_elapsed" "$stable_polls" "$tracking_complete" >&2
+                printf '[buildgit-settle] iterations=%d elapsed=%d stable_polls=%d tracking_complete=%s verified_exit=%s flushes=%d\n' \
+                    "$settle_iterations" "$settle_elapsed" "$stable_polls" "$tracking_complete" "$verified_exit" "$settle_flush_count" >&2
             fi
-            # Always run at least one force-flush pass after the settle loop.
-            # Even when settle exits "cleanly" on empty fd-3 output, late-arriving
-            # parent stages (notably Finalize) may not yet be reflected by the
-            # Jenkins API at the moment settle exited. The flush call uses
-            # _force_flush_completion_stages which re-reads the API and prints
-            # any newly-terminal parents. This costs ~1 iteration but is
-            # required for correctness — see integration_tests.bats
+            # Run at least one force-flush pass after the settle loop —
+            # UNLESS the settle loop ended via the flush-verified exit, in
+            # which case a flush already ran, agreed with an independent
+            # tracker sample, printed everything printable, and reported
+            # tracking_complete=true; another full-refetch pass is pure
+            # added latency. (Spec: monitor-exit-latency-spec.md § 3)
+            # For every other exit path (stable-polls cap, time cap,
+            # tracker-reported tracking_complete), the mandatory flush is
+            # still required: late-arriving parent stages (notably Finalize)
+            # may not yet be reflected by the Jenkins API at the moment
+            # settle exited, and parallel branch summaries can be deferred
+            # in printed_state while the tracker reports complete on CI with
+            # MONITOR_SETTLE_STABLE_POLLS=1 — see integration_tests.bats
             # parallel-substages tests which verify Finalize is printed.
-            if [[ "$tracking_complete" != "true" ]]; then
-                local flush_elapsed=0
-                local flush_iterations=0
-                local flush_max_iterations=${MONITOR_FLUSH_MAX_ITERATIONS:-1}
-                while [[ $flush_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && $flush_iterations -lt $flush_max_iterations && "$tracking_complete" != "true" ]]; do
-                    sleep 1
-                    flush_iterations=$((flush_iterations + 1))
-                    local flush_iteration_start flush_iteration_end flush_iteration_cost
-                    flush_iteration_start=$(date +%s)
-                    _buildgit_iter_cache_begin
-                    if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
-                        BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>"$stage_log_file" >"$stage_state_file"
-                        stage_state=$(cat "$stage_state_file")
-                        stage_output=$(cat "$stage_log_file")
-                        : > "$stage_log_file"
-                        if [[ -n "$stage_output" ]]; then
-                            printf '%s\n' "$stage_output"
-                        fi
-                    else
-                        BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>&1 >"$stage_state_file"
-                        stage_state=$(cat "$stage_state_file")
-                    fi
-                    _buildgit_iter_cache_end
-                    flush_iteration_end=$(date +%s)
-                    flush_iteration_cost=$((flush_iteration_end - flush_iteration_start + 1))
-                    if [[ "$flush_iteration_cost" -lt 1 ]]; then
-                        flush_iteration_cost=1
-                    fi
-                    tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
-                    flush_elapsed=$((flush_elapsed + flush_iteration_cost))
-                done
+            local flush_elapsed=0
+            local flush_iterations=0
+            local flush_max_iterations=${MONITOR_FLUSH_MAX_ITERATIONS:-1}
+            if [[ "$verified_exit" == "true" ]]; then
+                flush_iterations=1
             fi
+            while [[ $flush_iterations -eq 0 || ( $flush_elapsed -lt $MONITOR_SETTLE_MAX_SECONDS && $flush_iterations -lt $flush_max_iterations && "$tracking_complete" != "true" ) ]]; do
+                if [[ $flush_iterations -gt 0 ]]; then
+                    sleep 1
+                fi
+                flush_iterations=$((flush_iterations + 1))
+                local flush_iteration_start flush_iteration_end flush_iteration_cost
+                flush_iteration_start=$(date +%s)
+                _buildgit_iter_cache_begin
+                if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
+                    BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>"$stage_log_file" >"$stage_state_file"
+                    stage_state=$(cat "$stage_state_file")
+                    stage_output=$(cat "$stage_log_file")
+                    : > "$stage_log_file"
+                    if [[ -n "$stage_output" ]]; then
+                        printf '%s\n' "$stage_output"
+                    fi
+                else
+                    BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>&1 >"$stage_state_file"
+                    stage_state=$(cat "$stage_state_file")
+                fi
+                _buildgit_iter_cache_end
+                flush_iteration_end=$(date +%s)
+                flush_iteration_cost=$((flush_iteration_end - flush_iteration_start + 1))
+                if [[ "$flush_iteration_cost" -lt 1 ]]; then
+                    flush_iteration_cost=1
+                fi
+                tracking_complete=$(echo "$stage_state" | jq -r '.tracking_complete // false' 2>/dev/null || echo false)
+                flush_elapsed=$((flush_elapsed + flush_iteration_cost))
+            done
             if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
                 local total_ms
                 total_ms=$(_buildgit_timing_ms "$iter_start" "$(date +%s)")

@@ -195,7 +195,10 @@ Set `BUILDGIT_DEBUG_TIMING=1` during `push`, `build`, or `status -f` to emit std
 
 ```bash
 [buildgit-timing] iter=1 build_info=1000 stage_track=2000 total=3000 building=true
+[buildgit-settle] iterations=1 elapsed=2 stable_polls=1 tracking_complete=true verified_exit=true flushes=1
 ```
+
+The `[buildgit-settle]` line summarizes the post-completion settle phase: `verified_exit=true` means the monitor exited early because a completion flush agreed with an independent tracker sample; `flushes` counts verification flushes run inside the settle loop.
 
 If test-report retrieval fails due to communication issues (for example network/sandbox restrictions), `%t` shows `!err!` and buildgit logs:
 

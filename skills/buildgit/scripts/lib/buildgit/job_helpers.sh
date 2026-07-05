@@ -640,16 +640,17 @@ _wait_for_build_start() {
     done
 }
 
+# Fingerprint only the API-derived stage data (.parent/.nested). The settle
+# loop's job is to detect whether Jenkins is still mutating stage data;
+# .printed/.parallel_state are local print bookkeeping and would (a) reset
+# stability when a deferred row prints even though the API is stable, and
+# (b) make tracker-state vs flush-state fingerprints incomparable, which the
+# flush-verified settle exit requires.
+# Spec: monitor-exit-latency-spec.md § 1
 _stage_state_settle_fingerprint() {
     local stage_state="$1"
 
-    echo "$stage_state" | jq -cS '
-        del(
-            .parallel_state[]?.stable_polls,
-            .parallel_state[]?.wrapper_stable_polls,
-            .parallel_state[]?.branch_state[]?.stable_polls
-        )
-    ' 2>/dev/null || echo "$stage_state"
+    echo "$stage_state" | jq -cS '{parent: .parent, nested: .nested}' 2>/dev/null || echo "$stage_state"
 }
 
 # Monitor push-triggered build until completion

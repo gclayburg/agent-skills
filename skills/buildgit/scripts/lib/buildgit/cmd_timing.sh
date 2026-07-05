@@ -651,7 +651,7 @@ _build_timing_for_build() {
     stages_json=$(get_all_stages "$job_name" "$build_number")
     blue_nodes_json=$(get_blue_ocean_nodes "$job_name" "$build_number")
     console_output=$(get_console_output "$job_name" "$build_number")
-    stage_agent_map_json=$(_build_stage_agent_map "$console_output")
+    stage_agent_map_json=$(_build_stage_agent_map "$console_output" "$job_name" "$build_number")
     computers_json=""
     if declare -F _fetch_pipeline_computers >/dev/null 2>&1; then
         computers_json=$(_fetch_pipeline_computers 2>/dev/null) || computers_json=""

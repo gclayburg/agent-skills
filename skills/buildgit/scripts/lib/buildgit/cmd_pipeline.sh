@@ -361,7 +361,7 @@ _render_pipeline_for_build() {
     computers_json=$(_fetch_pipeline_computers 2>/dev/null) || computers_json=""
     node_label_map_json=$(_build_node_label_map "$computers_json")
     console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || console_output=""
-    stage_agent_map_json=$(_build_stage_agent_map "$console_output")
+    stage_agent_map_json=$(_build_stage_agent_map "$console_output" "$job_name" "$build_number")
     classified_json=$(_classify_pipeline_stages "$stages_json" "$blue_nodes_json" "$stage_agent_map_json" "$node_label_map_json")
     stage_tests_map_json=$(fetch_stage_test_suites "$job_name" "$build_number")
     classified_json=$(_enrich_pipeline_stages_with_tests "$classified_json" "$stage_tests_map_json")
