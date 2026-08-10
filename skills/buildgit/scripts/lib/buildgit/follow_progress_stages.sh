@@ -574,6 +574,10 @@ _get_follow_active_stages() {
                     continue
                     fi
                     ;;
+                NOT_EXECUTED)
+                    # Branch skipped by a when{} gate: never synthesize it as running.
+                    continue
+                    ;;
             esac
 
             local branch_agent

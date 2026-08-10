@@ -223,6 +223,13 @@ _build_agents_nodes_data() {
                   ]
                   | unique
                   | sort
+                ),
+                runningJobs: (
+                  if (.offline // false) then
+                    []
+                  else
+                    [.executors[]?.currentExecutable.url? | select(. != null)]
+                  end
                 )
               }
           ]
@@ -245,6 +252,40 @@ _agents_pluralize() {
 
 _decode_agents_payload() {
     printf '%s\n' "$1" | jq -Rr '@base64d'
+}
+
+# Condense a Jenkins build URL into the "job/branch #N" form that is actually
+# readable in a node listing. Multibranch URLs nest each level behind its own
+# /job/ segment, so the folder markers collapse into plain path separators.
+# Anything that does not parse as a build URL is returned unchanged.
+_agents_format_job_url() {
+    local url="$1"
+    local trimmed="${url%/}"
+    local build="${trimmed##*/}"
+    local job_path="${trimmed%/*}"
+
+    case "$job_path" in
+        */job/*) job_path="${job_path#*/job/}" ;;
+        *)
+            printf '%s' "$url"
+            return 0
+            ;;
+    esac
+
+    case "$build" in
+        ''|*[!0-9]*)
+            printf '%s' "$url"
+            return 0
+            ;;
+    esac
+
+    local result=""
+    while [[ "$job_path" == */job/* ]]; do
+        result="${result}${job_path%%/job/*}/"
+        job_path="${job_path#*/job/}"
+    done
+
+    printf '%s%s #%s' "$result" "$job_path" "$build"
 }
 
 _render_agents_human() {
@@ -348,6 +389,14 @@ _render_agents_nodes_human() {
             "$(_agents_pluralize "$executors" "executor")" \
             "$busy"
         printf '  Labels: %s\n' "$labels"
+
+        local running_label="  Running: "
+        local job_url
+        while IFS= read -r job_url; do
+            [[ -n "$job_url" ]] || continue
+            printf '%s%s\n' "$running_label" "$(_agents_format_job_url "$job_url")"
+            running_label="           "
+        done < <(printf '%s\n' "$node_json" | jq -r '.runningJobs[]?')
     done < <(printf '%s\n' "$nodes_json" | jq -r '.nodes[] | @base64')
 }
 

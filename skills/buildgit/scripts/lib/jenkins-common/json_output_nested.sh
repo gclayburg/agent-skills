@@ -173,6 +173,28 @@ _build_stage_agent_map_from_html() {
                     }
                 }
             }
+            # Nested stages{} under an agent-owning stage never emit their own
+            # "Running on" line; they run inside the enclosing allocation. Any
+            # labeled stage still unmapped inherits from the nearest enclosing
+            # node allocation on its enclosingId chain.
+            for (nid in label) {
+                stage_name = label[nid]
+                sub(/^Branch:[[:space:]]+/, "", stage_name)
+                if (stage_name in stage_agent_map) {
+                    continue
+                }
+                cur = nid
+                depth = 0
+                while ((cur in enclosing) && depth < 100) {
+                    cur = enclosing[cur]
+                    depth++
+                    if (cur in running_on_agent) {
+                        stage_agent_map[stage_name] = running_on_agent[cur]
+                        printf "%s\t%s\n", stage_name, running_on_agent[cur]
+                        break
+                    }
+                }
+            }
         }
     ' 2>/dev/null) || stage_agent_pairs=""
 
@@ -350,7 +372,7 @@ _map_stages_to_downstream() {
     printf '%s' "$tsv_input" | jq -Rsc '
         [ split("\n")
           | map(select(length > 0))
-          | map(split(""))
+          | map(split("\u001f"))
           | .[]
           | {(.[0]): {job: .[1], build: (.[2] | tonumber)}}
         ] | add // {}
@@ -518,10 +540,12 @@ _get_nested_stages() {
     local stage_agent_map="{}"
     local pipeline_scope_agent=""
     local stage_agent_map_is_html="false"
+    local html_map_attempted="false"
     if [[ -n "$console_output" ]]; then
         if _console_has_parallel_block "$console_output"; then
             local html_stage_agent_map
             html_stage_agent_map=$(_build_stage_agent_map_from_html "$job_name" "$build_number") || html_stage_agent_map="{}"
+            html_map_attempted="true"
             if [[ -n "$html_stage_agent_map" && "$html_stage_agent_map" != "{}" ]]; then
                 stage_agent_map="$html_stage_agent_map"
                 stage_agent_map_is_html="true"
@@ -531,6 +555,23 @@ _get_nested_stages() {
             stage_agent_map=$(_build_stage_agent_map "$console_output")
         fi
         pipeline_scope_agent=$(_extract_pre_stage_agent_from_console "$console_output")
+        if [[ "$stage_agent_map_is_html" != "true" && "$html_map_attempted" != "true" && -z "$pipeline_scope_agent" ]]; then
+            # Serial pipeline with `agent none` + a stage-scoped agent: nested
+            # stages{} under the agent-owning stage have no "Running on" lines
+            # and no pipeline-scope fallback, so the plain-text map leaves them
+            # agent-less. The annotated HTML console's enclosure chains can
+            # attribute them to the nearest enclosing node allocation.
+            local has_agentless_stage
+            has_agentless_stage=$(echo "$stages_json" | jq -r --argjson map "$stage_agent_map" \
+                '[.[]? | .name // empty | select(. != "") | select(($map[.] // "") == "")] | length > 0' 2>/dev/null) || has_agentless_stage="false"
+            if [[ "$has_agentless_stage" == "true" ]]; then
+                local html_fill_map
+                html_fill_map=$(_build_stage_agent_map_from_html "$job_name" "$build_number") || html_fill_map="{}"
+                if [[ -n "$html_fill_map" && "$html_fill_map" != "{}" ]]; then
+                    stage_agent_map=$(jq -cn --argjson text "$stage_agent_map" --argjson html "$html_fill_map" '$text + $html' 2>/dev/null) || stage_agent_map="$html_fill_map"
+                fi
+            fi
+        fi
     fi
 
     local parallel_info="{}"

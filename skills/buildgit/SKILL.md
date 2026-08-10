@@ -56,6 +56,14 @@ Invoke commands from the skill directory, or use the full path to `scripts/build
 | Watch a build that is already running or about to start | `scripts/buildgit status -f --once=60` |
 | Check what the last build did (already finished) | `scripts/buildgit status` |
 | Trigger a build without monitoring | `scripts/buildgit build --no-follow` |
+| Find out whether *any* build is running, on any branch or job | `scripts/buildgit agents --nodes` |
+
+**`status` is per-job; `agents --nodes` is server-wide.** `status` reports the current
+checkout's job/branch only, so it says nothing about builds running on other branches or
+other jobs. To answer "is anything running right now?", use `agents --nodes`: a build must
+occupy an executor, so `0 busy` across every node means nothing is running anywhere. Busy
+nodes list the builds they are running as `job/branch #N`, and `scripts/buildgit queue`
+shows anything waiting for a free executor.
 
 **When to use `build` vs `push`:**
 - Use `push` when you have commits to push — it pushes first, then monitors the Jenkins build triggered by that push.
@@ -109,7 +117,8 @@ Invoke commands from the skill directory, or use the full path to `scripts/build
 | `scripts/buildgit agents` | Show Jenkins executor capacity by label |
 | `scripts/buildgit agents --json` | Emit executor capacity and node details as JSON |
 | `scripts/buildgit agents --label <name>` | Show executor capacity for one Jenkins label |
-| `scripts/buildgit agents --nodes` | Pivot to one row per Jenkins node with all labels and busy/idle counts |
+| `scripts/buildgit agents --nodes` | Pivot to one row per Jenkins node with all labels, busy/idle counts, and the builds each node is running |
+| `scripts/buildgit agents -v` | Label view plus the build URL running on each busy node (the `-v` must follow `agents`) |
 | `scripts/buildgit timing` | Show per-stage timing for the latest successful build |
 | `scripts/buildgit timing --tests` | Include slowest test suites and test counts in timing output |
 | `scripts/buildgit timing --tests --by-stage` | Group test suites under the pipeline stages that published them |
