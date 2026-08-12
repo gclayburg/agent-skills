@@ -141,14 +141,33 @@ _resolve_effective_job_name() {
     echo "$top_job_name"
 }
 
+# Fetch per-branch build state for a multibranch job.
+# Usage: _fetch_multibranch_baselines "top-job-name"
+# Returns: JSON object { branch: { number, building } } on stdout, exit 0
+#          Exit 1 with NO stdout when Jenkins is unreachable or the response is
+#          unparseable. Callers must retry rather than treat a transient outage
+#          as "the job has no branches" — an empty map corrupts probe-all
+#          baselines and would make every branch look like a brand-new build.
 _fetch_multibranch_baselines() {
     local top_job_name="$1"
-    local job_path response
+    local job_path response baselines
 
     job_path=$(jenkins_job_path "$top_job_name")
-    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number,building]]")
+    if [[ -z "$job_path" ]]; then
+        return 1
+    fi
 
-    echo "$response" | jq '[.jobs[]? | {key: .name, value: {number: (.lastBuild.number // 0), building: (.lastBuild.building // false)}}] | from_entries'
+    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number,building]]" 2>/dev/null) || true
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+
+    baselines=$(printf '%s\n' "$response" | jq -c '[.jobs[]? | {key: .name, value: {number: (.lastBuild.number // 0), building: (.lastBuild.building // false)}}] | from_entries' 2>/dev/null) || return 1
+    if [[ -z "$baselines" || "$baselines" == "null" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$baselines"
 }
 
 # Validate Jenkins environment, resolve job name, verify connectivity

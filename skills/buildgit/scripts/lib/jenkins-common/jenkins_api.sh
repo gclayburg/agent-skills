@@ -835,7 +835,9 @@ get_last_build_number() {
     response=$(jenkins_api "${job_path}/api/json" 2>/dev/null) || true
 
     if [[ -n "$response" ]]; then
-        echo "$response" | jq -r '.lastBuild.number // 0'
+        # Suppress jq parse errors: this runs on every poll of the follow loop,
+        # so an unparseable response must not spam the terminal.
+        echo "$response" | jq -r '.lastBuild.number // 0' 2>/dev/null || echo "0"
     else
         echo "0"
     fi

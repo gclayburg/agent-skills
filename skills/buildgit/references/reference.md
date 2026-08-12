@@ -40,6 +40,14 @@ SUCCESS     #13 id=39ab12c Tests=19/0/0 Took 5m 02s on 2026-03-14T10:23:58-0700 
 
 `--probe-all` requires `-f`, rejects explicit branch jobs like `--job ralph1/main`, and falls back to normal single-job follow with a warning when the target job is not multibranch.
 
+If Jenkins becomes unreachable while probe-all is waiting, it keeps retrying and reports the outage on stderr (once per burst, then once per 12 consecutive failed polls) rather than latching onto a stale build:
+
+```
+[10:31:12] ⚠ Cannot reach Jenkins while waiting for a ralph1 build - retrying every 5s
+[10:32:12] ⚠ Still cannot reach Jenkins while waiting for a ralph1 build (12 consecutive failed polls)
+[10:32:22] ℹ Jenkins reachable again - resuming ralph1 branch polling
+```
+
 On TTY monitoring commands, use the global flag `--threads` before the subcommand to show active pipeline stages above the overall build bar:
 
 ```bash

@@ -652,6 +652,13 @@ _detect_probe_all_candidate() {
     local baselines_json="$1"
     local current_json="$2"
 
+    # Never hand empty/blank text to --argjson: jq aborts with
+    # "invalid JSON text passed to --argjson" on stderr, which the probe-all
+    # poll loop would repeat forever. No inputs means no candidate.
+    if [[ -z "${baselines_json//[$' \t\r\n']}" || -z "${current_json//[$' \t\r\n']}" ]]; then
+        return 0
+    fi
+
     jq -rn --argjson base "$baselines_json" --argjson curr "$current_json" '
         $curr
         | to_entries
@@ -659,7 +666,7 @@ _detect_probe_all_candidate() {
         | map(select((.value > 0) and (($base[.key] // 0) < .value)))
         | first // empty
         | "\(.key) \(.value)"
-    '
+    ' 2>/dev/null || true
 }
 
 # Convert rich baseline JSON { branch: { number, building } } to flat adjusted map.
@@ -667,14 +674,50 @@ _detect_probe_all_candidate() {
 # will immediately satisfy current > baseline for already-running builds.
 _normalize_probe_all_baselines() {
     local rich_json="$1"
-    echo "$rich_json" | jq 'with_entries(.value = (if .value.building == true and .value.number > 0 then .value.number - 1 else .value.number end))'
+    if [[ -z "${rich_json//[$' \t\r\n']}" ]]; then
+        return 0
+    fi
+    printf '%s\n' "$rich_json" | jq -c 'with_entries(.value = (if .value.building == true and .value.number > 0 then .value.number - 1 else .value.number end))' 2>/dev/null || true
 }
 
 # Convert rich baseline JSON to flat map of just build numbers (no adjustment).
 # Used for the "current" side of detection comparisons.
 _flatten_probe_all_baselines() {
     local rich_json="$1"
-    echo "$rich_json" | jq 'with_entries(.value = .value.number)'
+    if [[ -z "${rich_json//[$' \t\r\n']}" ]]; then
+        return 0
+    fi
+    printf '%s\n' "$rich_json" | jq -c 'with_entries(.value = .value.number)' 2>/dev/null || true
+}
+
+# Number of consecutive failed probe-all polls between repeat warnings.
+# At the default 5s poll interval this is roughly one warning per minute.
+_PROBE_ALL_FETCH_WARN_EVERY="${_PROBE_ALL_FETCH_WARN_EVERY:-12}"
+
+# Report that a probe-all poll could not reach Jenkins, without flooding the
+# terminal: warn on the first failure, then once every
+# _PROBE_ALL_FETCH_WARN_EVERY consecutive failures.
+# Writes to stderr on purpose — probe-all's stdout is captured by the caller's
+# $(...) and would not surface until the wait finally returns.
+_probe_all_log_fetch_failure() {
+    local top_job_name="$1"
+    local failures="$2"
+
+    if [[ "$failures" -eq 1 ]]; then
+        log_warning "Cannot reach Jenkins while waiting for a ${top_job_name} build - retrying every ${POLL_INTERVAL:-5}s" >&2
+    elif [[ $((failures % _PROBE_ALL_FETCH_WARN_EVERY)) -eq 0 ]]; then
+        log_warning "Still cannot reach Jenkins while waiting for a ${top_job_name} build (${failures} consecutive failed polls)" >&2
+    fi
+}
+
+# Announce that polling recovered, but only if we previously warned about it.
+_probe_all_log_fetch_recovery() {
+    local top_job_name="$1"
+    local failures="$2"
+
+    if [[ "$failures" -gt 0 ]]; then
+        log_info "Jenkins reachable again - resuming ${top_job_name} branch polling" >&2
+    fi
 }
 
 # Return 0 if the given branch name appears in the space-separated in-progress set.
@@ -696,8 +739,17 @@ _branch_was_in_progress() {
 # Spec: 2026-04-10_probe-all-initial-build-spec.md
 _follow_wait_probe_all() {
     local top_job_name="$1"
-    local raw_baselines in_progress_branches baselines
-    raw_baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    local raw_baselines in_progress_branches baselines fetch_failures=0
+
+    # Keep retrying the baseline fetch: an empty/failed response must never be
+    # accepted as a baseline, or every branch would look like a new build.
+    while ! raw_baselines=$(_fetch_multibranch_baselines "$top_job_name"); do
+        fetch_failures=$((fetch_failures + 1))
+        _probe_all_log_fetch_failure "$top_job_name" "$fetch_failures"
+        sleep "$POLL_INTERVAL"
+    done
+    _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
+    fetch_failures=0
     in_progress_branches=$(echo "$raw_baselines" | jq -r '[to_entries[] | select(.value.building == true) | .key] | join(" ")')
     baselines=$(_normalize_probe_all_baselines "$raw_baselines")
 
@@ -705,7 +757,14 @@ _follow_wait_probe_all() {
 
     while true; do
         local raw_current current detected
-        raw_current=$(_fetch_multibranch_baselines "$top_job_name")
+        if ! raw_current=$(_fetch_multibranch_baselines "$top_job_name"); then
+            fetch_failures=$((fetch_failures + 1))
+            _probe_all_log_fetch_failure "$top_job_name" "$fetch_failures"
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
+        fetch_failures=0
         current=$(_flatten_probe_all_baselines "$raw_current")
         detected=$(_detect_probe_all_candidate "$baselines" "$current")
 
@@ -734,18 +793,39 @@ _follow_wait_probe_all() {
 _follow_wait_probe_all_timeout() {
     local top_job_name="$1"
     local timeout_secs="$2"
-    local raw_baselines in_progress_branches baselines
-    raw_baselines=$(_fetch_multibranch_baselines "$top_job_name")
+    local raw_baselines in_progress_branches baselines fetch_failures=0
+    local deadline=$(( $(date +%s) + timeout_secs ))
+
+    # A failed baseline fetch is retried until the deadline; accepting an empty
+    # baseline would latch onto an already-finished build on the next poll.
+    while ! raw_baselines=$(_fetch_multibranch_baselines "$top_job_name"); do
+        fetch_failures=$((fetch_failures + 1))
+        _probe_all_log_fetch_failure "$top_job_name" "$fetch_failures"
+        if [[ $(date +%s) -ge $deadline ]]; then
+            return 1
+        fi
+        sleep "$POLL_INTERVAL"
+    done
+    _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
+    fetch_failures=0
     in_progress_branches=$(echo "$raw_baselines" | jq -r '[to_entries[] | select(.value.building == true) | .key] | join(" ")')
     baselines=$(_normalize_probe_all_baselines "$raw_baselines")
 
     log_info "Waiting for Jenkins build ${top_job_name} (any branch) to start..."
 
-    local deadline=$(( $(date +%s) + timeout_secs ))
-
     while true; do
         local raw_current current detected
-        raw_current=$(_fetch_multibranch_baselines "$top_job_name")
+        if ! raw_current=$(_fetch_multibranch_baselines "$top_job_name"); then
+            fetch_failures=$((fetch_failures + 1))
+            _probe_all_log_fetch_failure "$top_job_name" "$fetch_failures"
+            if [[ $(date +%s) -ge $deadline ]]; then
+                return 1
+            fi
+            sleep "$POLL_INTERVAL"
+            continue
+        fi
+        _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
+        fetch_failures=0
         current=$(_flatten_probe_all_baselines "$raw_current")
         detected=$(_detect_probe_all_candidate "$baselines" "$current")
 
