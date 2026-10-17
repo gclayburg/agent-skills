@@ -113,6 +113,16 @@ cmd_status() {
     if [[ "${STATUS_REVERSE:-false}" == "true" && "${STATUS_GITLOG:-false}" == "true" ]]; then
         _usage_error "Cannot use -r/--reverse with --gitlog"
     fi
+    # --bail-on-red needs the stage tracker in the full monitoring loop.
+    # Line mode runs its own lighter loop that does not track per-stage
+    # status, so the flag would silently do nothing there. Reject it rather
+    # than accept a flag that has no effect.
+    if [[ "${BAIL_ON_RED:-false}" == "true" && "$STATUS_LINE_MODE" == "true" ]]; then
+        _usage_error "Cannot combine --bail-on-red with --line"
+    fi
+    if [[ "${BAIL_ON_RED:-false}" == "true" && "$STATUS_FOLLOW_MODE" != "true" ]]; then
+        _usage_error "--bail-on-red requires -f/--follow"
+    fi
     if [[ "$STATUS_CONSOLE_TEXT_MODE" == "true" || "$STATUS_LIST_STAGES_MODE" == "true" ]]; then
         if [[ "$STATUS_CONSOLE_TEXT_MODE" == "true" && "$STATUS_LIST_STAGES_MODE" == "true" ]]; then
             _usage_error "Cannot combine --console-text with --list-stages"

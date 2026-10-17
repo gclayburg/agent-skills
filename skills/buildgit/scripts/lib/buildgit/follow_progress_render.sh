@@ -100,15 +100,34 @@ _get_queued_builds_for_progress() {
     echo "$queued"
 }
 
+# Arguments: job_name, build_number, work_start_ms, estimate_ms, [frame],
+#            [trigger_ms]
+# work_start_ms is when the build started running stages (see
+# _resolve_follow_work_start). When it is empty and trigger_ms is given, the
+# build has not started a stage yet (waiting for an executor or a lock) and the
+# line shows how long it has waited.
 _render_follow_line_in_progress() {
     local job_name="$1"
     local build_number="$2"
     local timestamp_ms="$3"
     local estimate_ms="$4"
     local frame="${5:-0}"
+    local trigger_ms="${6:-}"
 
     local now_ms elapsed_ms
     now_ms=$(($(date +%s) * 1000))
+
+    if [[ -z "$timestamp_ms" && "$trigger_ms" =~ ^[1-9][0-9]*$ ]]; then
+        local wait_ms estimate_display
+        wait_ms=$((now_ms - trigger_ms))
+        [[ "$wait_ms" -lt 0 ]] && wait_ms=0
+        estimate_display="unknown"
+        if [[ "$estimate_ms" =~ ^[1-9][0-9]*$ ]]; then
+            estimate_display=$(format_duration "$estimate_ms")
+        fi
+        echo "$(printf '%-12s' "IN_PROGRESS")Job ${job_name} #${build_number} $(_render_follow_line_progress_bar_unknown "$frame") waiting to start $(format_duration "$wait_ms") / ~${estimate_display}"
+        return 0
+    fi
     elapsed_ms=0
     if [[ "$timestamp_ms" =~ ^[0-9]+$ && "$timestamp_ms" -gt 0 ]]; then
         elapsed_ms=$((now_ms - timestamp_ms))
@@ -450,7 +469,8 @@ _display_follow_line_progress() {
         fi
     fi
     local primary_line
-    primary_line=$(_render_follow_line_in_progress "$job_name" "$build_number" "$primary_ts" "$estimate_ms" "$frame")
+    _resolve_follow_work_start "$job_name" "$build_number" "$primary_ts"
+    primary_line=$(_render_follow_line_in_progress "$job_name" "$build_number" "$_FOLLOW_WORK_START_RESULT" "$estimate_ms" "$frame" "$primary_ts")
     lines+=("$primary_line")
 
     if [[ "$running_count" -gt 0 ]]; then
@@ -465,7 +485,8 @@ _display_follow_line_progress() {
             if [[ -z "$running_num" ]]; then
                 continue
             fi
-            running_line=$(_render_follow_line_in_progress "$job_name" "$running_num" "$running_ts" "$estimate_ms" "$frame")
+            _resolve_follow_work_start "$job_name" "$running_num" "$running_ts"
+            running_line=$(_render_follow_line_in_progress "$job_name" "$running_num" "$_FOLLOW_WORK_START_RESULT" "$estimate_ms" "$frame" "$running_ts")
             lines+=("$running_line")
         done <<< "$running_lines"
     fi

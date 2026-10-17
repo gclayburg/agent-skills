@@ -1,3 +1,73 @@
+# Exit code for --bail-on-red: the build is still running but has already
+# failed. Distinct from 0 (success), 1 (failed/error), and 2 (in progress) so
+# a caller can tell "doomed, start diagnosing now" from "finished, failed".
+: "${BUILDGIT_EXIT_BAILED_ON_RED:=3}"
+
+# Report the stage that triggered --bail-on-red and why the build is doomed.
+# Usage: _report_bail_on_red "job" "build#" "stage name"
+#
+# Prints the failing stage plus the shared failure diagnostics, so the caller
+# gets the same console excerpt and infra/code classification it would have
+# received had it waited for the pipeline to finish.
+_report_bail_on_red() {
+    local job_name="$1"
+    local build_number="$2"
+    local failed_stage="$3"
+
+    echo ""
+    bg_log_error "Stage '${failed_stage}' FAILED - build #${build_number} cannot pass"
+    # ESSENTIAL, not INFO: the caller acts on these two lines, and bg_log_info
+    # is suppressed unless -v was passed.
+    bg_log_essential "Stopped monitoring early (--bail-on-red). The build is still running and was NOT cancelled."
+
+    local stage_console=""
+    stage_console=$(get_stage_console_output "$job_name" "$build_number" "$failed_stage" 2>/dev/null) || stage_console=""
+
+    # A stage that contains substages returns only its FIRST substage's log
+    # here, which for a Jenkins docker-agent failure is the git checkout --
+    # the actual error is never in it. Measured on phandlemono-handle #7:
+    # the stage console is 31 lines and classifies "unknown", while the full
+    # build console is 170 lines and classifies "infra".
+    #
+    # So the stage console is treated as a preferred excerpt, not as the
+    # evidence. Whenever it cannot account for the failure, fall back to the
+    # whole build console. Reporting "unknown" for a build that is plainly
+    # an infrastructure fault is the one outcome that makes this feature
+    # useless: the caller neither retries nor gets a real diagnosis.
+    local evidence_console="$stage_console"
+    local classification=""
+    classification=$(classify_build_failure "$stage_console" "unknown")
+    if [[ "$classification" == "unknown" ]]; then
+        local full_console=""
+        full_console=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || full_console=""
+        if [[ -n "$full_console" ]]; then
+            local full_classification
+            full_classification=$(classify_build_failure "$full_console" "unknown")
+            if [[ "$full_classification" != "unknown" ]]; then
+                evidence_console="$full_console"
+                classification="$full_classification"
+            elif [[ -z "$stage_console" ]]; then
+                evidence_console="$full_console"
+            fi
+        fi
+    fi
+
+    if [[ -n "$evidence_console" ]]; then
+        echo ""
+        echo "${COLOR_YELLOW}=== Stage '${failed_stage}' Errors ===${COLOR_RESET}"
+        extract_error_lines "$evidence_console" 30
+        echo "${COLOR_YELLOW}=================================${COLOR_RESET}"
+    fi
+    echo ""
+    echo "${COLOR_YELLOW}$(format_failure_classification "$classification")${COLOR_RESET}"
+
+    local console_url
+    console_url=$(jenkins_console_url "$job_name" "$build_number" 2>/dev/null) || console_url=""
+    if [[ -n "$console_url" ]]; then
+        bg_log_essential "Full console: ${console_url}"
+    fi
+}
+
 # Monitor a build until completion
 # Reuses monitoring logic from pushmon.sh pattern
 # Arguments: job_name, build_number
@@ -33,6 +103,20 @@ _print_deferred_header_fields() {
         echo "            ${_CORRELATION_COLOR}${_CORRELATION_SYMBOL} ${_CORRELATION_DESC}${COLOR_RESET}"
         _DEFERRED_COMMIT=false
         printed_something=true
+    fi
+
+    # Print Waited line once the build reaches its first stage
+    if [[ "${_DEFERRED_WAITED:-false}" == "true" ]]; then
+        _compute_build_wait "$job_name" "$build_number" "$build_json"
+        if [[ "$_BUILD_WAIT_STATE" != "waiting" ]]; then
+            local waited_display
+            waited_display=$(_format_build_wait_display)
+            if [[ -n "$waited_display" ]]; then
+                echo "Waited:     ${waited_display}"
+                printed_something=true
+            fi
+            _DEFERRED_WAITED=false
+        fi
     fi
 
     # Print Agent line if it was deferred
@@ -194,7 +278,7 @@ __buildgit_monitor_build_impl() {
         result=$(echo "$build_info" | jq -r '.result // empty')
 
         # Collect deferred-header output first so API calls complete before clear+redraw.
-        if [[ "${_DEFERRED_COMMIT:-false}" == "true" || "${_DEFERRED_AGENT:-false}" == "true" || "${_DEFERRED_CONSOLE:-false}" == "true" ]]; then
+        if [[ "${_DEFERRED_COMMIT:-false}" == "true" || "${_DEFERRED_AGENT:-false}" == "true" || "${_DEFERRED_CONSOLE:-false}" == "true" || "${_DEFERRED_WAITED:-false}" == "true" ]]; then
             if [[ "$render_progress" == "true" && -n "$deferred_log_file" ]]; then
                 _print_deferred_header_fields "$job_name" "$build_number" "${_DEFERRED_BUILD_JSON:-$build_info}" >"$deferred_log_file" 2>&1 || true
                 deferred_output=$(cat "$deferred_log_file")
@@ -427,6 +511,41 @@ __buildgit_monitor_build_impl() {
             stage_track_ms=$(_buildgit_timing_ms "$stage_track_start" "$(date +%s)")
         fi
 
+        # --bail-on-red: stop monitoring as soon as a stage has failed, rather
+        # than waiting for the whole pipeline to drain.
+        #
+        # Without this, an agent watching a build learns the verdict only when
+        # Jenkins reports it. On a monorepo pipeline with a parallel fan-out
+        # that is minutes later: a measured phandlemono build knew it had
+        # failed at +232s but did not say so until +573s, because a sibling
+        # branch ran on for another 5m28s.
+        #
+        # This stops MONITORING only. The build keeps running and is never
+        # cancelled -- other work may still depend on it, and cancelling
+        # someone else's build is not this tool's decision.
+        if [[ "${BAIL_ON_RED:-false}" == "true" ]]; then
+            local first_failed_stage
+            first_failed_stage=$(_find_first_failed_stage "$stage_state")
+            if [[ -n "$first_failed_stage" ]]; then
+                if [[ "$showed_progress" == "true" ]]; then
+                    _clear_follow_line_progress_final
+                    showed_progress=false
+                fi
+                if [[ -n "$deferred_output" ]]; then
+                    printf '%s\n' "$deferred_output"
+                fi
+                if [[ -n "$stage_output" ]]; then
+                    printf '%s\n' "$stage_output"
+                fi
+                _buildgit_iter_cache_end
+                _report_bail_on_red "$job_name" "$build_number" "$first_failed_stage"
+                rm -f "$stage_log_file" 2>/dev/null || true
+                rm -f "$stage_state_file" 2>/dev/null || true
+                rm -f "$deferred_log_file" 2>/dev/null || true
+                return "$BUILDGIT_EXIT_BAILED_ON_RED"
+            fi
+        fi
+
         # Verbose-only elapsed time messages
         # Spec: full-stage-print-spec.md, Verbose mode
         if [[ "$VERBOSE_MODE" == "true" && $((elapsed - last_time_report)) -ge 30 ]]; then
@@ -573,6 +692,7 @@ __buildgit_display_build_in_progress_banner_impl() {
     _DEFERRED_COMMIT=false
     _DEFERRED_AGENT=false
     _DEFERRED_CONSOLE=false
+    _DEFERRED_WAITED=false
     _DEFERRED_BUILD_JSON=""
     _DEFERRED_HEADER_ATTEMPTS=0
     if [[ -z "$_BC_COMMIT_SHA" || "$_BC_COMMIT_SHA" == "unknown" ]]; then
@@ -582,12 +702,17 @@ __buildgit_display_build_in_progress_banner_impl() {
     if [[ -z "${_META_AGENT:-}" ]]; then
         _DEFERRED_AGENT=true
     fi
+    # display_building_output computed the wait; a build still before its first
+    # stage gets its final Waited: line once that stage starts.
+    if [[ "${_BUILD_WAIT_STATE:-}" == "waiting" ]]; then
+        _DEFERRED_WAITED=true
+    fi
     local banner_url
     banner_url=$(echo "$build_json" | jq -r '.url // empty')
     if [[ -n "$banner_url" ]] && [[ "$_DEFERRED_COMMIT" == "true" || "$_DEFERRED_AGENT" == "true" ]]; then
         _DEFERRED_CONSOLE=true
     fi
-    if [[ "$_DEFERRED_COMMIT" == "true" || "$_DEFERRED_AGENT" == "true" || "$_DEFERRED_CONSOLE" == "true" ]]; then
+    if [[ "$_DEFERRED_COMMIT" == "true" || "$_DEFERRED_AGENT" == "true" || "$_DEFERRED_CONSOLE" == "true" || "$_DEFERRED_WAITED" == "true" ]]; then
         _DEFERRED_BUILD_JSON="$build_json"
     fi
 
@@ -964,7 +1089,7 @@ _display_monitoring_preamble() {
     _display_prior_jobs_block "$job_name" "$prior_jobs_count" "$no_tests" "$max_build_number"
 
     local estimate_ms
-    estimate_ms=$(_get_last_successful_build_duration "$job_name")
+    estimate_ms=$(_get_build_time_estimate_ms "$job_name")
     if [[ "$estimate_ms" =~ ^[1-9][0-9]*$ ]]; then
         log_info "Estimated build time = $(format_duration "$estimate_ms")"
     else

@@ -37,6 +37,10 @@ _parse_status_options() {
                 STATUS_FOLLOW_MODE=true
                 shift
                 ;;
+            --bail-on-red)
+                BAIL_ON_RED=true
+                shift
+                ;;
             --probe-all)
                 STATUS_PROBE_ALL=true
                 shift

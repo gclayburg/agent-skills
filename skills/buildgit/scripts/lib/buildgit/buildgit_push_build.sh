@@ -254,7 +254,16 @@ cmd_push() {
         _display_build_in_progress_banner "$job_name" "$new_build_number" "" \
             "$push_commit_sha" "$push_commit_msg" "$push_correlation_status"
 
-        if ! _monitor_build "$job_name" "$new_build_number" "true" "true"; then
+        local monitor_rc=0
+        _monitor_build "$job_name" "$new_build_number" "true" "true" || monitor_rc=$?
+        # Exit 3 is --bail-on-red: monitoring stopped deliberately at a red
+        # stage. It is a real verdict, not an interruption, and the bail
+        # report has already been printed -- pass it straight through so the
+        # caller can act on it.
+        if [[ "$monitor_rc" -eq "$BUILDGIT_EXIT_BAILED_ON_RED" ]]; then
+            return "$monitor_rc"
+        fi
+        if [[ "$monitor_rc" -ne 0 ]]; then
             bg_log_error "Build monitoring interrupted or timed out"
             local console_url
             console_url=$(jenkins_console_url "$job_name" "$new_build_number")
@@ -319,7 +328,14 @@ cmd_push() {
         "$push_commit_sha" "$push_commit_msg" "$push_correlation_status"
 
     # Monitor build until completion
-    if ! _monitor_build "$job_name" "$new_build_number" "true" "true"; then
+    local monitor_rc=0
+    _monitor_build "$job_name" "$new_build_number" "true" "true" || monitor_rc=$?
+    # Exit 3 is --bail-on-red: a deliberate stop at a red stage, already
+    # reported. Pass it through instead of relabelling it as a timeout.
+    if [[ "$monitor_rc" -eq "$BUILDGIT_EXIT_BAILED_ON_RED" ]]; then
+        return "$monitor_rc"
+    fi
+    if [[ "$monitor_rc" -ne 0 ]]; then
         bg_log_error "Build monitoring interrupted or timed out"
         local console_url
         console_url=$(jenkins_console_url "$job_name" "$new_build_number")
@@ -400,7 +416,14 @@ cmd_build() {
     _display_build_in_progress_banner "$job_name" "$build_number"
 
     # Monitor build until completion
-    if ! _monitor_build "$job_name" "$build_number" "true" "true"; then
+    local monitor_rc=0
+    _monitor_build "$job_name" "$build_number" "true" "true" || monitor_rc=$?
+    # Exit 3 is --bail-on-red: a deliberate stop at a red stage, already
+    # reported. Pass it through instead of relabelling it as a timeout.
+    if [[ "$monitor_rc" -eq "$BUILDGIT_EXIT_BAILED_ON_RED" ]]; then
+        return "$monitor_rc"
+    fi
+    if [[ "$monitor_rc" -ne 0 ]]; then
         bg_log_error "Build monitoring interrupted or timed out"
         local console_url
         console_url=$(jenkins_console_url "$job_name" "$build_number")

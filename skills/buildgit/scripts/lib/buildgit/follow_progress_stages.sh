@@ -229,6 +229,115 @@ _get_last_successful_build_duration() {
     fi
 }
 
+# Busy span (ms) of each recent SUCCESS run of a pipeline job, newest first,
+# at most <limit> values, one per line. A run's busy span is its last stage end
+# minus its first stage start, which leaves out the time a pipeline waited for
+# an executor or a pipeline-level lock() (Jenkins counts that wait in
+# `duration` but not as queue time). A run with no started stage contributes its durationMillis.
+# Prints nothing when wfapi is unavailable (non-pipeline job, API error).
+_get_recent_successful_work_spans() {
+    local job_name="$1"
+    local limit="${2:-5}"
+    local job_path
+    job_path=$(jenkins_job_path "$job_name")
+    if [[ -z "$job_path" ]]; then
+        return 0
+    fi
+
+    local response
+    response=$(jenkins_api "${job_path}/wfapi/runs" 2>/dev/null) || true
+    if [[ -z "$response" ]]; then
+        return 0
+    fi
+
+    echo "$response" | jq -r --argjson limit "$limit" '
+        [ .[]?
+          | select(.status == "SUCCESS")
+          | ([.stages[]? | select((.startTimeMillis // 0) > 0)]) as $s
+          | if ($s | length) > 0 then
+                (($s | map(.startTimeMillis + (.durationMillis // 0)) | max)
+                 - ($s | map(.startTimeMillis) | min))
+            else
+                (.durationMillis // 0)
+            end
+          | select(. > 0)
+        ]
+        | .[:$limit]
+        | .[]
+    ' 2>/dev/null || true
+}
+
+# Median of newline-separated integers on stdin; the mean of the middle pair
+# for an even count. Prints nothing for empty input.
+_median_ms() {
+    awk 'NF { print $1 }' | sort -n | awk '
+        { v[NR] = $1 }
+        END {
+            if (NR == 0) exit
+            if (NR % 2) print v[(NR + 1) / 2]
+            else printf "%d\n", (v[NR / 2] + v[NR / 2 + 1]) / 2
+        }'
+}
+
+# Sibling branch jobs to borrow an estimate from when a multibranch job has
+# too few samples: the local repo's origin/HEAD branch, then main, then master.
+_default_branch_estimate_jobs() {
+    local job_name="$1"
+    if [[ "$job_name" != */* ]]; then
+        return 0
+    fi
+    local top_job="${job_name%%/*}"
+    local branch_name="${job_name#*/}"
+
+    local origin_head candidate seen=" "
+    origin_head=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || origin_head=""
+    origin_head="${origin_head#refs/remotes/origin/}"
+
+    for candidate in $origin_head main master; do
+        if [[ "$candidate" == "$branch_name" || "$seen" == *" $candidate "* ]]; then
+            continue
+        fi
+        seen+="$candidate "
+        echo "${top_job}/${candidate}"
+    done
+}
+
+# Expected running time (ms) of the next build of job_name, or empty when
+# unknown: the median busy span of the last BUILDGIT_ESTIMATE_SAMPLES (default
+# 5) successful runs. A branch with fewer than 2 successful samples borrows the
+# default branch's estimate; failing that it uses its single sample, and a job
+# without wfapi data falls back to lastSuccessfulBuild's Jenkins duration.
+_get_build_time_estimate_ms() {
+    local job_name="$1"
+    local limit="${BUILDGIT_ESTIMATE_SAMPLES:-5}"
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || limit=5
+
+    local spans count
+    spans=$(_get_recent_successful_work_spans "$job_name" "$limit")
+    count=$(printf '%s\n' "$spans" | awk 'NF { n++ } END { print n + 0 }')
+    if [[ "$count" -ge 2 ]]; then
+        printf '%s\n' "$spans" | _median_ms
+        return 0
+    fi
+
+    local default_job default_spans
+    while IFS= read -r default_job; do
+        [[ -z "$default_job" ]] && continue
+        default_spans=$(_get_recent_successful_work_spans "$default_job" "$limit")
+        if [[ -n "$default_spans" ]]; then
+            printf '%s\n' "$default_spans" | _median_ms
+            return 0
+        fi
+    done <<< "$(_default_branch_estimate_jobs "$job_name")"
+
+    if [[ "$count" -eq 1 ]]; then
+        printf '%s\n' "$spans" | _median_ms
+        return 0
+    fi
+
+    _get_last_successful_build_duration "$job_name"
+}
+
 _get_stage_duration_estimates_for_build() {
     local job_name="$1"
     local build_number="$2"
@@ -260,22 +369,17 @@ _prime_follow_progress_estimates() {
     _FOLLOW_BUILD_ESTIMATE_MS=""
     _FOLLOW_STAGE_ESTIMATES_JSON="{}"
 
-    local last_success_json
-    last_success_json=$(_get_last_successful_build_metadata "$job_name")
-    if [[ -z "$last_success_json" ]]; then
-        return 0
-    fi
-
-    local duration build_number
-    duration=$(echo "$last_success_json" | jq -r '.duration // empty' 2>/dev/null) || duration=""
-    build_number=$(echo "$last_success_json" | jq -r '.number // empty' 2>/dev/null) || build_number=""
-
     if [[ "$THREADS_MODE" == "true" ]]; then
+        local last_success_json build_number
+        last_success_json=$(_get_last_successful_build_metadata "$job_name")
+        build_number=$(echo "$last_success_json" | jq -r '.number // empty' 2>/dev/null) || build_number=""
         _FOLLOW_STAGE_ESTIMATES_JSON=$(_get_stage_duration_estimates_for_build "$job_name" "$build_number")
     fi
 
-    if [[ "$duration" =~ ^[0-9]+$ ]]; then
-        _FOLLOW_BUILD_ESTIMATE_MS="$duration"
+    local estimate
+    estimate=$(_get_build_time_estimate_ms "$job_name")
+    if [[ "$estimate" =~ ^[0-9]+$ ]]; then
+        _FOLLOW_BUILD_ESTIMATE_MS="$estimate"
     fi
 }
 

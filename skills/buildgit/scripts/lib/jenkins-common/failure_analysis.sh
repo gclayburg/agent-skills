@@ -24,13 +24,69 @@ check_build_failed() {
 # use jenkins_job_path() directly.
 detect_all_downstream_builds() {
     local console_output="$1"
+    local downstream_lines completed_lines started_branches combined_lines
 
     # Match both formats:
     #   Starting building: phandlemono-handle #68
     #   Starting building: phandlemono-handle » main #8
-    echo "$console_output" | grep -oE 'Starting building: [^ ]+ (» [^ ]+ )?#[0-9]+' 2>/dev/null | \
+    downstream_lines=$(echo "$console_output" | grep -oE 'Starting building: [^ ]+ (» [^ ]+ )?#[0-9]+' 2>/dev/null | \
         sed -E 's/Starting building: ([^ ]+) » ([^ ]+) #([0-9]+)/\1\/\2 \3/' | \
-        sed -E 's/Starting building: ([^ ]+) #([0-9]+)/\1 \2/' || true
+        sed -E 's/Starting building: ([^ ]+) #([0-9]+)/\1 \2/' || true)
+
+    # Jenkins may print a human-readable display name containing spaces in the
+    # "Starting building" line, for example:
+    #   Starting building: chrome extension build » main #42
+    # That line does not contain the real job name, so it cannot be used to
+    # construct a Jenkins API path by itself. The Pipeline build step's own
+    # completion message does contain the real job name:
+    #   ✅ phandlemono-chrome-handle-extension build #42 completed successfully
+    # Recover that job name and pair it with the branch from the start line.
+    completed_lines=$(echo "$console_output" | sed -nE \
+        's/.*[[:space:]]([[:alnum:]_.\/-]+)[[:space:]]+build #([0-9]+) completed.*/\1\t\2/p' || true)
+    if [[ -n "$completed_lines" ]]; then
+        started_branches=$(echo "$console_output" | awk '
+            /Starting building:/ {
+                line = $0
+                sub(/^.*Starting building: /, "", line)
+                if (line ~ / » [^ ]+ #[0-9]+$/) {
+                    build = line
+                    sub(/^.* #/, "", build)
+                    branch = line
+                    sub(/^.* » /, "", branch)
+                    sub(/ #[0-9]+$/, "", branch)
+                    print build "\t" branch
+                }
+            }
+        ')
+
+        combined_lines="$downstream_lines"
+        while IFS="$(printf '\t')" read -r completed_job completed_build; do
+            [[ -z "$completed_job" || -z "$completed_build" ]] && continue
+            local completed_branch completed_line
+            completed_branch=$(echo "$started_branches" | awk -F '\t' -v build="$completed_build" \
+                '$1 == build { print $2; exit }')
+            if [[ -n "$completed_branch" ]]; then
+                completed_line="${completed_job}/${completed_branch} ${completed_build}"
+            else
+                completed_line="${completed_job} ${completed_build}"
+            fi
+            if ! echo "$combined_lines" | grep -Fqx "$completed_line" 2>/dev/null; then
+                if [[ -n "$combined_lines" ]]; then
+                    combined_lines="${combined_lines}
+${completed_line}"
+                else
+                    combined_lines="$completed_line"
+                fi
+            fi
+        done <<EOF
+$completed_lines
+EOF
+        downstream_lines="$combined_lines"
+    fi
+
+    if [[ -n "$downstream_lines" ]]; then
+        printf '%s\n' "$downstream_lines"
+    fi
 }
 
 # Select the best downstream build match for a given stage when multiple exist.
@@ -47,12 +103,19 @@ _downstream_stage_job_match_score() {
     [[ -z "$normalized_stage_name" ]] && echo "0" && return
 
     local job_lc
-    job_lc=$(echo "$job_name" | tr '[:upper:]' '[:lower:]')
+    # A multibranch job is represented as job/branch. Match the stage against
+    # the job name only; branch names can contain words such as "chrome" or
+    # "extension" and must not influence stage-to-job selection.
+    job_lc=$(echo "${job_name%%/*}" | tr '[:upper:]' '[:lower:]')
 
     # Split job name into segments for word-level matching
     # Use -, /, and _ as delimiters so "phandlemono" stays one segment
     local job_segments
     job_segments=$(echo "$job_lc" | sed 's/[-/_]/ /g')
+    local job_match_text
+    # Do not let the repository's common namespace create substring matches
+    # (for example, "handle" inside "phandlemono").
+    job_match_text=$(echo "$job_segments" | sed 's/^phandlemono[[:space:]]*//')
 
     local score=0
     local token
@@ -73,12 +136,55 @@ _downstream_stage_job_match_score() {
         done
         if [[ "$matched_segment" == "true" ]]; then
             score=$((score + 2))
-        elif [[ "$job_lc" == *"$token"* ]]; then
+        elif [[ "$job_match_text" == *"$token"* ]]; then
             score=$((score + 1))
         fi
     done
 
     echo "$score"
+}
+
+# Return the number of meaningful job-name segments not named by the stage.
+# Used only as a tie-breaker: "Build Handle" should prefer phandlemono-handle
+# over phandlemono-chrome-handle-extension when both contain an exact "handle"
+# segment, while "Build Chrome Extension" still wins on its higher score.
+_downstream_stage_job_extra_segments() {
+    local stage_name="$1"
+    local job_name="$2"
+
+    local normalized_stage_name
+    normalized_stage_name=$(echo "$stage_name" | tr '[:upper:]' '[:lower:]' | \
+        sed -E 's/[^a-z0-9]+/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//')
+
+    local job_lc job_segments
+    job_lc=$(echo "${job_name%%/*}" | tr '[:upper:]' '[:lower:]')
+    job_segments=$(echo "$job_lc" | sed 's/^phandlemono[-\/_]*//; s/[-/_]/ /g')
+
+    local extras=0
+    local segment token matched
+    for segment in $job_segments; do
+        [[ ${#segment} -lt 3 ]] && continue
+        case "$segment" in
+            build|trigger|stage|component|components|parallel|test|tests)
+                continue
+                ;;
+        esac
+        matched=false
+        for token in $normalized_stage_name; do
+            case "$token" in
+                build|trigger|stage|component|components|parallel|test|tests)
+                    continue
+                    ;;
+            esac
+            if [[ "$segment" == "$token" ]]; then
+                matched=true
+                break
+            fi
+        done
+        [[ "$matched" == "false" ]] && extras=$((extras + 1))
+    done
+
+    echo "$extras"
 }
 
 _select_downstream_build_for_stage() {
@@ -126,9 +232,13 @@ _select_downstream_build_for_stage() {
             best_score="$score"
             best_line="$line"
         elif [[ "$score" -eq "$best_score" && -n "$best_line" ]]; then
-            local best_build
+            local best_build current_extra best_extra
             best_build=$(echo "$best_line" | awk '{print $2}')
-            if [[ "$build" =~ ^[0-9]+$ && "$best_build" =~ ^[0-9]+$ && "$build" -gt "$best_build" ]]; then
+            current_extra=$(_downstream_stage_job_extra_segments "$stage_name" "$job")
+            best_extra=$(_downstream_stage_job_extra_segments "$stage_name" "$(echo "$best_line" | awk '{print $1}')")
+            if [[ "$current_extra" -lt "$best_extra" ]]; then
+                best_line="$line"
+            elif [[ "$current_extra" -eq "$best_extra" && "$build" =~ ^[0-9]+$ && "$best_build" =~ ^[0-9]+$ && "$build" -gt "$best_build" ]]; then
                 best_line="$line"
             fi
         fi
@@ -847,6 +957,139 @@ extract_triggering_commit() {
     echo "${sha:-unknown}"
     echo "${message:-unknown}"
     return 0
+}
+
+# =============================================================================
+# Failure Classification
+# =============================================================================
+#
+# Distinguish a build that failed because the CI infrastructure broke from one
+# that failed because the code or its tests are wrong. The two need opposite
+# responses: an infra failure should be retried on the same commit, a code
+# failure should be diagnosed and fixed. Without this an agent hunts for a
+# source defect that does not exist, or a human is paged for a transient
+# docker hiccup.
+#
+# Classifications:
+#   infra   - agent, docker, registry, or disk fault; retry the same commit
+#   code    - test failures or a compiler/test-runner error; fix the source
+#   unknown - not recognised; neither retry nor diagnosis is clearly right
+
+# Console patterns that indicate the infrastructure failed, not the code.
+# Each is drawn from a failure this project has actually observed. Kept as a
+# newline-delimited string rather than an array so bash 3.2 handles it.
+#
+# "Timeout after N seconds" is deliberately NOT on its own: a test suite that
+# blows its own timeout prints the same shape. It only counts as infra when
+# paired with a container that could not be started (see below).
+_BUILDGIT_INFRA_PATTERNS='No such container
+Cannot connect to the Docker daemon
+Is the docker daemon running
+manifest for .* not found
+pull access denied
+ChannelClosedException
+Agent went offline
+Cannot contact [^:]*: hudson.remoting.ChannelClosedException
+no space left on device
+Failed to run image'
+
+# Console patterns that indicate the code or its tests are wrong.
+# Deliberately narrow: an ambiguous failure should land in "unknown" rather
+# than be asserted as a code defect.
+_BUILDGIT_CODE_PATTERNS='error: cannot find symbol
+error: incompatible types
+Compilation failed
+compilation error
+error TS[0-9]+
+SyntaxError
+Tests run:.*Failures: [1-9]
+Tests run:.*Errors: [1-9]
+[1-9][0-9]* failing
+FAILED.*AssertionError
+AssertionError
+npm ERR! Test failed'
+
+# Classify a build failure from its console output and test results.
+#
+# Usage: classify_build_failure "<console_output>" [failed_test_count]
+# Echoes: infra | code | unknown   (always exit 0)
+#
+# Precedence: a build with real test failures is ALWAYS "code", even when an
+# infra pattern also appears somewhere in its console. Retrying will not turn
+# a red test green, and a wrong "infra" verdict costs a full build cycle and
+# then produces a stale diagnosis.
+classify_build_failure() {
+    local console_output="$1"
+    local failed_test_count="${2:-0}"
+
+    # Non-numeric or empty test counts mean "unknown", not "zero".
+    if [[ "$failed_test_count" =~ ^[0-9]+$ ]] && [[ "$failed_test_count" -gt 0 ]]; then
+        echo "code"
+        return 0
+    fi
+
+    if [[ -z "$console_output" ]]; then
+        echo "unknown"
+        return 0
+    fi
+
+    # "Failed to run image" is the docker-agent start failure. Jenkins reports
+    # it with a preceding "Timeout after N seconds" when the pull or run hung.
+    # Either half alone is weaker evidence, so the pair is checked first and
+    # short-circuits.
+    if echo "$console_output" | grep -qE 'Timeout after [0-9]+ seconds' 2>/dev/null &&
+       echo "$console_output" | grep -qF 'Failed to run image' 2>/dev/null; then
+        echo "infra"
+        return 0
+    fi
+
+    # Code evidence beats a bare infra pattern: a stack trace mentioning a
+    # closed channel can appear in an otherwise ordinary test failure.
+    local pattern
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        if echo "$console_output" | grep -qE "$pattern" 2>/dev/null; then
+            echo "code"
+            return 0
+        fi
+    done <<EOF
+${_BUILDGIT_CODE_PATTERNS}
+EOF
+
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        if echo "$console_output" | grep -qE "$pattern" 2>/dev/null; then
+            echo "infra"
+            return 0
+        fi
+    done <<EOF
+${_BUILDGIT_INFRA_PATTERNS}
+EOF
+
+    echo "unknown"
+    return 0
+}
+
+# Human-readable one-line explanation of a classification, for the failure
+# summary printed by snapshot, follow, and bail-on-red output. Keeping the
+# wording in one place is what keeps those three surfaces consistent, as
+# required by CLAUDE.md.
+#
+# Usage: format_failure_classification "infra"
+format_failure_classification() {
+    local classification="$1"
+
+    case "$classification" in
+        infra)
+            echo "Classification: infra - CI infrastructure fault, retry the same commit"
+            ;;
+        code)
+            echo "Classification: code - source or test defect, fix before retrying"
+            ;;
+        *)
+            echo "Classification: unknown - could not attribute the failure automatically"
+            ;;
+    esac
 }
 
 # =============================================================================

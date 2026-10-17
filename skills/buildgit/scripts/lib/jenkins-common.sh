@@ -334,6 +334,7 @@ source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/api_test_results.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/stage_test_correlation.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/failure_analysis.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/stage_display.sh"
+source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/build_wait.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/output_render.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/json_output.sh"
 
@@ -362,11 +363,15 @@ display_failure_output() {
     fi
 
     # Display banner
+    _compute_build_wait "$job_name" "$build_number" "$build_json"
+    local waited_display
+    waited_display=$(_format_build_wait_display)
+
     log_banner "failure"
 
     _print_build_header "$job_name" "$build_number" "${COLOR_RED}${result}${COLOR_RESET}" \
         "$trigger_type" "$trigger_user" "$commit_sha" "$commit_msg" "$correlation_status" \
-        "$timestamp" "$agent" "$url"
+        "$timestamp" "$agent" "$url" "$waited_display"
 
     # Display all stages (includes not-executed stages for failed builds)
     # Spec: full-stage-print-spec.md, Section: Display Functions

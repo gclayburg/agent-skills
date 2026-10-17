@@ -364,6 +364,7 @@ cmd_status() {
 # Sets: PUSH_NO_FOLLOW, PUSH_GIT_ARGS
 _parse_push_options() {
     PUSH_NO_FOLLOW=false
+    BAIL_ON_RED=false
     PUSH_LINE_MODE=false
     PUSH_PRIOR_JOBS=3
     PUSH_GIT_ARGS=()
@@ -371,6 +372,10 @@ _parse_push_options() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --bail-on-red)
+                BAIL_ON_RED=true
+                shift
+                ;;
             --no-follow)
                 PUSH_NO_FOLLOW=true
                 shift
@@ -548,7 +553,7 @@ _wait_for_build_start() {
 
     queue_item_path=$(_queue_item_path_from_url "$queue_url")
     if _status_stdout_is_tty; then
-        queue_estimate_ms=$(_get_last_successful_build_duration "$job_name")
+        queue_estimate_ms=$(_get_build_time_estimate_ms "$job_name")
     fi
 
     while true; do
@@ -624,7 +629,8 @@ _wait_for_build_start() {
                         running_building=$(echo "$running_build_json" | jq -r '.building // false' 2>/dev/null) || running_building=false
                         if [[ "$running_building" == "true" ]]; then
                             running_timestamp=$(echo "$running_build_json" | jq -r '.timestamp // 0' 2>/dev/null) || running_timestamp=0
-                            sticky_lines+=("$(_render_follow_line_in_progress "$job_name" "$running_build_number" "$running_timestamp" "$queue_estimate_ms" "$queue_frame")")
+                            _resolve_follow_work_start "$job_name" "$running_build_number" "$running_timestamp"
+                            sticky_lines+=("$(_render_follow_line_in_progress "$job_name" "$running_build_number" "$_FOLLOW_WORK_START_RESULT" "$queue_estimate_ms" "$queue_frame" "$running_timestamp")")
                         fi
                     fi
                 fi
@@ -670,6 +676,47 @@ _stage_state_settle_fingerprint() {
     local stage_state="$1"
 
     echo "$stage_state" | jq -cS '{parent: .parent, nested: .nested}' 2>/dev/null || echo "$stage_state"
+}
+
+# Name the stage that first entered FAILED, for --bail-on-red.
+# Usage: _find_first_failed_stage "$stage_state"
+# Echoes: stage name, or empty when no stage has failed. Always exit 0.
+#
+# Only FAILED counts. The other terminal statuses are deliberately excluded:
+#
+#   ABORTED     - once a pipeline uses `failFast`, the siblings of a failed
+#                 parallel branch are aborted. Bailing on ABORTED would name
+#                 a cancelled bystander instead of the branch that broke.
+#   UNSTABLE    - flaky-test territory; the caller still wants the full test
+#                 report, so let the build finish.
+#   NOT_BUILT / NOT_EXECUTED
+#               - a when{} gate skipped the stage. Normal on feature branches
+#                 where every deploy stage is skipped.
+#
+# Cascade suppression: when a component build fails, every downstream stage
+# fails a second or two later. Ordering by end time (startTimeMillis +
+# durationMillis) reports the real cause rather than whichever cascade victim
+# the poll happened to observe first. Entries without timing fields (the
+# tracker emits name/status only in some paths) fall back to array order,
+# which is already pipeline order.
+_find_first_failed_stage() {
+    local stage_state="$1"
+
+    [[ -z "$stage_state" ]] && return 0
+
+    echo "$stage_state" | jq -r '
+        [ (.parent // [])[], (.nested // [])[] ]
+        | map(select((.status // "") == "FAILED"))
+        | if length == 0 then empty
+          else
+            ( map(select(has("startTimeMillis") and has("durationMillis")))
+              | sort_by(.startTimeMillis + .durationMillis) ) as $timed
+            | (if ($timed | length) > 0 then $timed[0] else .[0] end)
+            | .name // empty
+          end
+    ' 2>/dev/null || true
+
+    return 0
 }
 
 # Monitor push-triggered build until completion

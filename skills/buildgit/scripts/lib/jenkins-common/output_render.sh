@@ -131,6 +131,7 @@ _print_build_header() {
     local timestamp="$9"
     local agent="${10:-}"
     local url="${11:-}"
+    local waited_display="${12:-}"
     local trigger_display commit_display
 
     trigger_display=$(_format_trigger_display "$trigger_type" "$trigger_user")
@@ -148,6 +149,9 @@ _print_build_header() {
     fi
 
     echo "Started:    $(format_timestamp "$timestamp")"
+    if [[ -n "$waited_display" ]]; then
+        echo "Waited:     ${waited_display}"
+    fi
     if [[ -n "$agent" ]]; then
         echo "Agent:      ${agent}"
     fi
@@ -183,11 +187,15 @@ display_success_output() {
     fi
 
     # Display banner
+    _compute_build_wait "$job_name" "$build_number" "$build_json"
+    local waited_display
+    waited_display=$(_format_build_wait_display)
+
     log_banner "success"
 
     _print_build_header "$job_name" "$build_number" "${COLOR_GREEN}SUCCESS${COLOR_RESET}" \
         "$trigger_type" "$trigger_user" "$commit_sha" "$commit_msg" "$correlation_status" \
-        "$timestamp" "$agent" "$url"
+        "$timestamp" "$agent" "$url" "$waited_display"
 
     # Display all stages
     # Spec: full-stage-print-spec.md, Section: Display Functions
@@ -250,11 +258,15 @@ display_failure_output() {
     fi
 
     # Display banner
+    _compute_build_wait "$job_name" "$build_number" "$build_json"
+    local waited_display
+    waited_display=$(_format_build_wait_display)
+
     log_banner "failure"
 
     _print_build_header "$job_name" "$build_number" "${COLOR_RED}${result}${COLOR_RESET}" \
         "$trigger_type" "$trigger_user" "$commit_sha" "$commit_msg" "$correlation_status" \
-        "$timestamp" "$agent" "$url"
+        "$timestamp" "$agent" "$url" "$waited_display"
 
     # Display all stages (includes not-executed stages for failed builds)
     # Spec: full-stage-print-spec.md, Section: Display Functions
@@ -541,6 +553,35 @@ _display_failure_diagnostics() {
 
     # 4. Error log section (respects --console and test failure suppression)
     _display_error_log_section "$job_name" "$build_number" "$console_output" "$parent_test_json"
+
+    # 5. Failure classification: infra vs code.
+    # Placed here, in the single shared entry point, so the snapshot path,
+    # the monitoring path, and the bail-on-red report all report the same
+    # verdict. CLAUDE.md requires status / status -f / status --json stay
+    # consistent, and duplicating the call per caller is how they drift.
+    _display_failure_classification "$console_output" "$parent_test_json"
+}
+
+# Print the infra/code verdict for a failed build.
+# Usage: _display_failure_classification "<console_output>" "<parent_test_json>"
+#
+# A communication failure fetching the test report leaves the count unknown.
+# That is an absence of evidence, so it is passed through as a non-numeric
+# value and classify_build_failure declines to call it a code failure.
+_display_failure_classification() {
+    local console_output="$1"
+    local parent_test_json="${2:-}"
+
+    local failed_count="unknown"
+    if [[ -n "$parent_test_json" ]]; then
+        failed_count=$(echo "$parent_test_json" | jq -r '.failed // .failCount // "unknown"' 2>/dev/null) || failed_count="unknown"
+    fi
+
+    local classification
+    classification=$(classify_build_failure "$console_output" "$failed_count")
+
+    echo ""
+    echo "${COLOR_YELLOW}$(format_failure_classification "$classification")${COLOR_RESET}"
 }
 
 # Display in-progress build output (unified header format)
@@ -572,6 +613,10 @@ display_building_output() {
     fi
 
     # Display banner
+    _compute_build_wait "$job_name" "$build_number" "$build_json"
+    local waited_display
+    waited_display=$(_format_build_wait_display)
+
     log_banner "building"
 
     # Display running-time message if provided (status -f joining in-progress build)
@@ -587,7 +632,7 @@ display_building_output() {
 
     _print_build_header "$job_name" "$build_number" "${COLOR_YELLOW}BUILDING${COLOR_RESET}" \
         "$trigger_type" "$trigger_user" "$commit_sha" "$commit_msg" "$correlation_status" \
-        "$timestamp" "$agent" "$header_url"
+        "$timestamp" "$agent" "$header_url" "$waited_display"
 }
 
 # =============================================================================

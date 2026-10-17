@@ -49,6 +49,16 @@ output_json() {
             ;;
     esac
 
+    # Time the build waited before its first stage (see _compute_build_wait)
+    local waited_seconds="null" waiting_to_start=false
+    _compute_build_wait "$job_name" "$build_number" "$build_json"
+    if [[ "$_BUILD_WAIT_MS" =~ ^[0-9]+$ ]]; then
+        waited_seconds=$((_BUILD_WAIT_MS / 1000))
+    fi
+    if [[ "$_BUILD_WAIT_STATE" == "waiting" ]]; then
+        waiting_to_start=true
+    fi
+
     # Build base JSON
     local json_output
     local trigger_user_value="$trigger_user"
@@ -65,6 +75,8 @@ output_json() {
         --arg status "$result" \
         --argjson building "$building" \
         --argjson duration_seconds "$duration_seconds" \
+        --argjson waited_seconds "$waited_seconds" \
+        --argjson waiting_to_start "$waiting_to_start" \
         --arg timestamp "$(format_timestamp_iso "$timestamp")" \
         --arg url "$url" \
         --arg trigger_type "$trigger_type" \
@@ -82,6 +94,8 @@ output_json() {
                 status: (if $status == "null" then null else $status end),
                 building: $building,
                 duration_seconds: $duration_seconds,
+                waited_seconds: $waited_seconds,
+                waiting_to_start: $waiting_to_start,
                 timestamp: (if $timestamp == "null" then null else $timestamp end),
                 url: $url
             },
@@ -217,6 +231,25 @@ output_json() {
                     has_test_failures=true
                 fi
             fi
+
+            # Classify the failure as infra vs code so a monitoring agent can
+            # tell a transient CI fault (retry the same commit) from a real
+            # defect (fix the source). Uses the same function as the human
+            # failure summary, keeping status / status -f / status --json
+            # consistent as CLAUDE.md requires.
+            #
+            # A communication failure fetching the report leaves the count
+            # genuinely unknown, so pass that through rather than defaulting
+            # to 0 -- "no report" must not read as "no test failures".
+            local classification_test_count="unknown"
+            if [[ "$test_report_rc" -ne 2 && -n "$collected_results" ]]; then
+                classification_test_count="$fail_count"
+            fi
+            local classification
+            classification=$(classify_build_failure "$console_output" "$classification_test_count")
+            json_output=$(echo "$json_output" | jq \
+                --arg classification "$classification" \
+                '. + {classification: $classification}')
 
             if [[ "$has_test_failures" == "true" && -z "${CONSOLE_MODE:-}" ]]; then
                 # Suppress error_summary when test failures present and no --console

@@ -95,6 +95,7 @@ shows anything waiting for a free executor.
 | `scripts/buildgit status --console-text [stage]` | Raw build console or one stage's console text; empty parent stages recurse into descendant substages |
 | `scripts/buildgit status --list-stages [--json]` | List stage names or emit the raw stage array |
 | `scripts/buildgit status -f --once` | Follow current/next build to completion, then exit (10s timeout) |
+| `scripts/buildgit status -f --bail-on-red` | Follow, but stop at the first FAILED stage instead of waiting for the pipeline (exit 3) |
 | `scripts/buildgit status -f --once=N` | Same, but wait up to N seconds for a build to start |
 | `scripts/buildgit status -f --probe-all` | Follow the next build that starts on any multibranch branch |
 | `scripts/buildgit status -f --probe-all --once` | Follow one multibranch branch build, then exit |
@@ -105,11 +106,13 @@ shows anything waiting for a free executor.
 | `scripts/buildgit --threads '[%a] %S %p' status -f --line` | Follow with custom live per-stage row formatting on TTY |
 | `scripts/buildgit status --json` | Machine-readable Jenkins build status |
 | `scripts/buildgit push` | git push + monitor Jenkins build until complete |
+| `scripts/buildgit push --bail-on-red` | git push + stop monitoring at the first FAILED stage (exit 3) |
 | `scripts/buildgit push --prior-jobs <N>` | git push + preamble with N prior builds + estimate |
 | `scripts/buildgit push --no-follow` | git push only, no build monitoring |
 | `scripts/buildgit push --line` | git push + compact one-line monitoring (TTY shows progress bar) |
 | `scripts/buildgit push --format '<fmt>'` | git push + compact one-line monitoring with custom format |
 | `scripts/buildgit build` | Trigger a new build + monitor until complete |
+| `scripts/buildgit build --bail-on-red` | Trigger + stop monitoring at the first FAILED stage (exit 3) |
 | `scripts/buildgit build --prior-jobs <N>` | Trigger + preamble with N prior builds + estimate |
 | `scripts/buildgit build --no-follow` | Trigger only, no monitoring |
 | `scripts/buildgit build --line` | Trigger + compact one-line monitoring (TTY shows progress bar) |
@@ -155,6 +158,7 @@ Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-
 | 0 | Success (build passed, or git command succeeded) |
 | 1 | Build failed, or an error occurred |
 | 2 | Build is currently in progress |
+| 3 | `--bail-on-red` stopped monitoring: a stage has FAILED and the build cannot pass. The build is still running and was NOT cancelled. |
 
 **Build states:**  as reported by Jenkins
 - `SUCCESS` — build passed, all tests green
@@ -193,6 +197,70 @@ On failed builds, buildgit shows a curated error summary by default.
 For agent-safe follow mode, prefer:
 - `scripts/buildgit status -f --once` to follow exactly one build and exit
 - `scripts/buildgit status -f --probe-all --once` when the next multibranch build may start on a different branch than the current checkout
+
+## Failing fast (`--bail-on-red`)
+
+By default, monitoring returns only when Jenkins reports the build result. On a
+pipeline with a parallel fan-out, that can be minutes after the outcome was
+actually decided: a measured monorepo build knew it had failed at +232s, when
+one parallel branch went red, but did not report `FAILURE` until +573s because
+a sibling branch ran on for another 5m28s.
+
+`--bail-on-red` stops monitoring within one poll interval of the first stage
+entering `FAILED` and exits **3**. Use it whenever an agent is going to act on
+the failure, so diagnosis can start while the doomed build is still draining.
+
+```bash
+scripts/buildgit push --bail-on-red      # exit 0 green, 3 doomed, 1 error
+scripts/buildgit build --bail-on-red
+scripts/buildgit status -f --bail-on-red
+```
+
+The report names the failing stage, prints its console excerpt, and gives the
+infra/code classification described below.
+
+**It stops monitoring, not the build.** buildgit never cancels a Jenkins build
+— other work may depend on it. Expect the build to still be running after a
+bail; treat it as busy when checking for a free executor.
+
+**Which statuses trigger it.** Only `FAILED`. Deliberately excluded:
+- `ABORTED` — with `failFast` pipelines, the siblings of a failed parallel
+  branch are aborted, so bailing on `ABORTED` would name a cancelled bystander
+  rather than the branch that broke.
+- `UNSTABLE` — flaky-test territory; you still want the full test report.
+- `NOT_BUILT` / `NOT_EXECUTED` — a `when {}` gate skipped the stage, which is
+  normal on feature branches where deploy stages are gated off.
+
+When several stages have failed, the one reported is the **earliest to end**,
+not the first seen. Downstream stages cascade within a second or two of the
+real failure, so array order would routinely name a victim instead of a cause.
+
+**Restrictions.** `--bail-on-red` requires follow mode and is rejected with
+`--line` and `--no-follow`. Line mode runs a separate monitoring loop with no
+per-stage tracking, so the flag cannot work there; it is refused rather than
+silently ignored.
+
+## Failure classification (infra vs code)
+
+Failed builds are classified so a caller can tell a transient CI fault from a
+real defect. The verdict appears in the human failure summary, in follow-mode
+completion output, in the `--bail-on-red` report, and as a top-level
+`classification` field in `status --json`.
+
+| Value | Meaning | Right response |
+|-------|---------|----------------|
+| `infra` | docker daemon/agent/registry/disk fault, image pull or start timeout | retry the same commit; do not edit code |
+| `code` | test failures, or a compiler/test-runner error | diagnose and fix the source |
+| `unknown` | not recognised | assert nothing; inspect manually |
+
+```bash
+scripts/buildgit status --json | jq -r '.classification'
+```
+
+A build with real test failures is always `code`, even when an infra pattern
+also appears in its console — retrying cannot turn a red test green. When the
+test report cannot be fetched at all, the count is treated as unknown rather
+than zero, so a missing report never masquerades as "no test failures".
 
 ## Build Optimization
 

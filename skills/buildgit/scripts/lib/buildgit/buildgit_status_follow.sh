@@ -193,7 +193,14 @@ _cmd_status_follow() {
                 # Display build info banner before entering monitoring loop
                 # Spec: unify-follow-log-spec.md, Section 5 (buildgit status -f)
                 _display_build_in_progress_banner "$job_name" "$build_number" "$running_msg"
-                _monitor_build "$job_name" "$build_number" "true" "true"
+                local follow_monitor_rc=0
+                _monitor_build "$job_name" "$build_number" "true" "true" || follow_monitor_rc=$?
+                # --bail-on-red stopped at a red stage while the build is
+                # still running. There is no completion to handle, and the
+                # bail report is already printed, so return the code now.
+                if [[ "$follow_monitor_rc" -eq "$BUILDGIT_EXIT_BAILED_ON_RED" ]]; then
+                    return "$follow_monitor_rc"
+                fi
                 # Display build completion (test results if applicable + Finished line)
                 # Spec: unify-follow-log-spec.md, Section 4 (Build Completion)
                 if _handle_build_completion "$job_name" "$build_number"; then

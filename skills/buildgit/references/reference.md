@@ -29,6 +29,10 @@ SUCCESS     #56 id=0046c54 Tests=19/0/0 Took 6m 39s on 2026-02-24T10:14:10-0700 
 
 Use `--prior-jobs 0` to suppress the prior-jobs block.
 
+The estimate is how long recent successful builds spent running stages: for each run, the last stage end minus the first stage start, which leaves out the time a pipeline waits for an executor or a pipeline-level `lock()` before its first stage (Jenkins counts that wait in a build's `duration`). buildgit takes the median of the last 5 successful runs (`BUILDGIT_ESTIMATE_SAMPLES`). A multibranch branch with fewer than 2 successful runs borrows the default branch's estimate (`origin/HEAD`, else `main`, else `master`). Jobs without pipeline stage data fall back to the last successful build's duration. The progress bar's elapsed time likewise starts at the first stage; before any stage starts the bar shows `waiting to start <time>` instead of a percentage.
+
+Build headers show a `Waited:` line under `Started:`: how long the build waited before doing work. That is the time its queue item spent blocked or buildable (for example behind `disableConcurrentBuilds()`, from the Jenkins metrics plugin's TimeInQueueAction) plus the time from the build start to its first stage (a pipeline-level `lock()` in `options {}`, or the pipeline agent's executor). The SCM quiet period is not counted. Waits under 10 seconds show as `----`. If a followed build is still before its first stage when its header prints, the header shows `Waited:     still waiting (2m 10s so far)` and a final `Waited:     31m 7s` line follows when the first stage starts. A `lock()` taken inside a stage is part of that stage's time, not of the wait. `status --json` reports the same value as `build.waited_seconds` (`null` when Jenkins has neither queue nor stage data) with `build.waiting_to_start: true` while the build has not reached its first stage.
+
 For multibranch jobs where you do not know which branch Jenkins will build next, use `--probe-all` with follow mode:
 
 ```bash
@@ -425,6 +429,7 @@ Trigger:    Manual by Ralph AI Read Only
 Commit:     4ae2fc1  fix: resolve port 9222 conflict and remove deliberate build failures
             ✓ Your commit (HEAD)
 Started:    2026-02-20 20:23:56
+Waited:     ----
 Agent:      agent8_sixcore
 Console:    http://palmer.garyclayburg.com:18080/job/phandlemono-IT/39/console
 
@@ -503,6 +508,7 @@ Trigger:    Manual by Ralph AI Read Only
 Commit:     4ae2fc1  fix: resolve port 9222 conflict and remove deliberate build failures
             ✓ Your commit (HEAD)
 Started:    2026-02-21 09:02:43
+Waited:     ----
 Agent:      agent8_sixcore
 Console:    http://palmer.garyclayburg.com:18080/job/phandlemono-IT/40/console
 [09:02:49] ℹ   Stage: [agent8_sixcore] Declarative: Checkout SCM (<1s)
