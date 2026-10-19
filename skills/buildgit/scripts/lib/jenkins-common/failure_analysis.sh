@@ -263,18 +263,32 @@ find_failed_downstream_build() {
         return
     fi
 
-    # Check each downstream build to find the one that failed
+    # Check each downstream build to find the one that failed. Remember the
+    # last one whose result could not be fetched: it is the only acceptable
+    # fallback. A downstream build known to have succeeded is never the root
+    # cause -- when every downstream build passed, the failure is in the
+    # parent's own stages and the caller must look there.
+    local unknown_build="" build_info result
     while IFS=' ' read -r job_name build_number; do
         if [[ -n "$job_name" && -n "$build_number" ]]; then
-            if check_build_failed "$job_name" "$build_number"; then
+            build_info=$(get_build_info "$job_name" "$build_number" 2>/dev/null) || build_info=""
+            result=""
+            if [[ -n "$build_info" ]]; then
+                result=$(echo "$build_info" | jq -r '.result // empty' 2>/dev/null) || result=""
+            fi
+            if [[ -n "$result" && "$result" != "SUCCESS" ]]; then
                 echo "$job_name $build_number"
                 return
+            fi
+            if [[ -z "$build_info" ]]; then
+                unknown_build="$job_name $build_number"
             fi
         fi
     done <<< "$all_builds"
 
-    # If no failed build found, return the last one (fallback)
-    echo "$all_builds" | tail -1
+    if [[ -n "$unknown_build" ]]; then
+        echo "$unknown_build"
+    fi
 }
 
 # Extract error lines from console output
@@ -990,8 +1004,11 @@ pull access denied
 ChannelClosedException
 Agent went offline
 Cannot contact [^:]*: hudson.remoting.ChannelClosedException
-no space left on device
 Failed to run image'
+
+# A full disk on the agent (docker layer writes, npm ci's tar extraction).
+# Strong enough to outrank the code patterns; see classify_build_failure.
+_BUILDGIT_DISK_FULL_PATTERN='no space left on device|ENOSPC'
 
 # Console patterns that indicate the code or its tests are wrong.
 # Deliberately narrow: an ambiguous failure should land in "unknown" rather
@@ -1033,12 +1050,29 @@ classify_build_failure() {
         return 0
     fi
 
+    # Every match below reads the console from a here-string, never from
+    # `echo "$console_output" | grep -q`. buildgit runs under `set -o
+    # pipefail`: when grep -q exits at an early match in a console larger than
+    # a pipe buffer, echo dies of SIGPIPE and the pipeline reports "no match".
+    # That turned a 918 KB disk-full console into "unknown".
+
+    # A full disk. Checked before the code patterns: a truncated
+    # node_modules or class directory makes the next tool report a
+    # SyntaxError or compile error whose real cause is the disk. A lost
+    # durable-task heartbeat ("wrapper script does not seem to be touching the
+    # log file") usually follows, and is covered by this verdict; on its own
+    # it can be a hung test, so it is deliberately not an infra pattern.
+    if grep -qE "$_BUILDGIT_DISK_FULL_PATTERN" <<< "$console_output" 2>/dev/null; then
+        echo "infra"
+        return 0
+    fi
+
     # "Failed to run image" is the docker-agent start failure. Jenkins reports
     # it with a preceding "Timeout after N seconds" when the pull or run hung.
     # Either half alone is weaker evidence, so the pair is checked first and
     # short-circuits.
-    if echo "$console_output" | grep -qE 'Timeout after [0-9]+ seconds' 2>/dev/null &&
-       echo "$console_output" | grep -qF 'Failed to run image' 2>/dev/null; then
+    if grep -qE 'Timeout after [0-9]+ seconds' <<< "$console_output" 2>/dev/null &&
+       grep -qF 'Failed to run image' <<< "$console_output" 2>/dev/null; then
         echo "infra"
         return 0
     fi
@@ -1048,7 +1082,7 @@ classify_build_failure() {
     local pattern
     while IFS= read -r pattern; do
         [[ -z "$pattern" ]] && continue
-        if echo "$console_output" | grep -qE "$pattern" 2>/dev/null; then
+        if grep -qE "$pattern" <<< "$console_output" 2>/dev/null; then
             echo "code"
             return 0
         fi
@@ -1058,7 +1092,7 @@ EOF
 
     while IFS= read -r pattern; do
         [[ -z "$pattern" ]] && continue
-        if echo "$console_output" | grep -qE "$pattern" 2>/dev/null; then
+        if grep -qE "$pattern" <<< "$console_output" 2>/dev/null; then
             echo "infra"
             return 0
         fi

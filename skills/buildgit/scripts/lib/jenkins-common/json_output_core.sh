@@ -305,20 +305,20 @@ _build_failure_json() {
         # Get failed stage for root job
         failed_stage=$(get_failed_stage "$job_name" "$build_number" 2>/dev/null) || true
 
-        # Find downstream builds and their failure status
-        local downstream_builds
-        downstream_builds=$(detect_all_downstream_builds "$console_output")
+        # Find the downstream build that failed, if any. Downstream builds
+        # that all succeeded mean the failure is in this job's own stages
+        # (for example a parallel test stage), so it is diagnosed below from
+        # this job's console -- never from a passing downstream build.
+        local failed_downstream
+        failed_downstream=$(find_failed_downstream_build "$console_output")
 
-        if [[ -n "$downstream_builds" ]]; then
+        if [[ -n "$failed_downstream" ]]; then
             # Track the deepest failed job
             local current_console="$console_output"
             local current_job="$job_name"
             local current_build="$build_number"
 
             while true; do
-                local failed_downstream
-                failed_downstream=$(find_failed_downstream_build "$current_console")
-
                 if [[ -z "$failed_downstream" ]]; then
                     break
                 fi
@@ -342,6 +342,8 @@ _build_failure_json() {
                     if [[ -n "$ds_stage" ]]; then
                         failed_stage="$ds_stage"
                     fi
+
+                    failed_downstream=$(find_failed_downstream_build "$current_console")
                 else
                     break
                 fi
@@ -353,7 +355,7 @@ _build_failure_json() {
                 error_summary=$(extract_error_lines "$current_console" 30)
             fi
         else
-            # No downstream — use stage-aware error extraction (mirrors _display_error_logs)
+            # No failed downstream — use stage-aware error extraction (mirrors _display_error_logs)
             if [[ -n "$failed_stage" ]]; then
                 local stage_logs
                 stage_logs=$(extract_stage_logs "$console_output" "$failed_stage")

@@ -316,7 +316,12 @@ _display_failed_jobs_tree() {
         local failed_downstream
         failed_downstream=$(find_failed_downstream_build "$console_output")
 
-        echo "  → ${job_name}${stage_suffix}"
+        if [[ -z "$failed_downstream" ]]; then
+            # Every downstream build passed: the failure is in this job's own stages
+            echo "  → ${job_name}${stage_suffix}  ${COLOR_RED}← FAILED${COLOR_RESET}"
+        else
+            echo "  → ${job_name}${stage_suffix}"
+        fi
 
         # Display downstream builds with indentation
         local indent="    "

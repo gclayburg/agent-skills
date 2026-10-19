@@ -249,13 +249,15 @@ completion output, in the `--bail-on-red` report, and as a top-level
 
 | Value | Meaning | Right response |
 |-------|---------|----------------|
-| `infra` | docker daemon/agent/registry/disk fault, image pull or start timeout | retry the same commit; do not edit code |
+| `infra` | docker daemon/agent/registry fault, full disk (`ENOSPC` / `no space left on device`, even when a lost durable-task heartbeat or a compile error from truncated files follows), image pull or start timeout | retry the same commit; do not edit code |
 | `code` | test failures, or a compiler/test-runner error | diagnose and fix the source |
 | `unknown` | not recognised | assert nothing; inspect manually |
 
 ```bash
 scripts/buildgit status --json | jq -r '.classification'
 ```
+
+`failure.root_cause_job` names the deepest downstream build that actually failed. When every downstream build succeeded, it is the job itself and `failed_stage` is its own first failed stage (for example a parallel test stage) — never a passing downstream build.
 
 A build with real test failures is always `code`, even when an infra pattern
 also appears in its console — retrying cannot turn a red test green. When the
