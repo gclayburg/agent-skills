@@ -425,13 +425,15 @@ _get_follow_active_stages() {
         blue_nodes_json=$(get_blue_ocean_nodes "$job_name" "$build_number" 2>/dev/null) || blue_nodes_json="[]"
         [[ -z "$blue_nodes_json" || "$blue_nodes_json" == "null" ]] && blue_nodes_json="[]"
 
+        local console_structure
+        console_structure=$(_console_pipeline_structure "$console_output")
         local mapping_wrapper_names mapping_wrapper_name
         mapping_wrapper_names=$(echo "$base_stages_json" | jq -r '.[].name // empty' 2>/dev/null) || mapping_wrapper_names=""
         while IFS= read -r mapping_wrapper_name; do
             [[ -z "$mapping_wrapper_name" ]] && continue
 
             local mapping_branch_names mapping_branch_substages mapping_branch_name
-            mapping_branch_names=$(_detect_parallel_branches "$console_output" "$mapping_wrapper_name")
+            mapping_branch_names=$(_detect_parallel_branches "$console_structure" "$mapping_wrapper_name")
             [[ -z "$mapping_branch_names" || "$mapping_branch_names" == "[]" ]] && continue
 
             mapping_branch_substages=$(_detect_branch_substages "$console_output" "$mapping_wrapper_name")
@@ -489,13 +491,15 @@ _get_follow_active_stages() {
     local wrapper_lines
     wrapper_lines=$(echo "$base_stages_json" | jq -r '.[] | [.name, (.status // ""), (.startTimeMillis // 0), (.durationMillis // 0)] | @tsv' 2>/dev/null) || wrapper_lines=""
 
+    local wrapper_structure=""
+    [[ -n "$console_output" ]] && wrapper_structure=$(_console_pipeline_structure "$console_output")
     local wrapper_name wrapper_status wrapper_start_ms wrapper_duration_ms
     while IFS=$'\t' read -r wrapper_name wrapper_status wrapper_start_ms wrapper_duration_ms; do
         [[ -z "$wrapper_name" ]] && continue
         [[ -z "$console_output" ]] && continue
 
         local branch_names
-        branch_names=$(_detect_parallel_branches "$console_output" "$wrapper_name")
+        branch_names=$(_detect_parallel_branches "$wrapper_structure" "$wrapper_name")
         [[ -z "$branch_names" || "$branch_names" == "[]" ]] && continue
 
         local active_branch_count

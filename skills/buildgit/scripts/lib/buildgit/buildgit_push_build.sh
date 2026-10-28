@@ -49,6 +49,10 @@ _handle_build_completion() {
         log_info "Duration: $(format_duration "$duration_ms")"
     fi
 
+    # The monitored build's logs were cached for the monitor loop and the
+    # completion report above; neither needs them any more.
+    _console_session_cache_end
+
     # Return appropriate exit code
     if [[ "$result" == "SUCCESS" ]]; then
         return 0

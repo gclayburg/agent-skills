@@ -549,7 +549,7 @@ _monitor_build_line_mode() {
         estimate_ms="${_FOLLOW_BUILD_ESTIMATE_MS:-}"
     fi
 
-    while [[ $elapsed -lt $MAX_BUILD_TIME ]]; do
+    while [[ $MAX_BUILD_TIME -le 0 || $elapsed -lt $MAX_BUILD_TIME ]]; do
         build_json=$(get_build_info "$job_name" "$build_number")
         if [[ -z "$build_json" ]]; then
             sleep "$POLL_INTERVAL"

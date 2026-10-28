@@ -28,6 +28,28 @@ jenkins_api_with_status() {
     curl -s -g -w "\n%{http_code}" -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" "$url"
 }
 
+# Make authenticated GET request saving response headers and body to files.
+# Used for logText/progressive{Text,Html}, whose X-Text-Size, X-More-Data and
+# X-ConsoleAnnotator response headers drive incremental console fetching.
+# Usage: jenkins_api_progressive "/job/x/1/logText/progressiveText?start=0" headers_file body_file [console_annotator]
+# Returns: curl exit status (non-zero on HTTP errors)
+jenkins_api_progressive() {
+    local endpoint="$1"
+    local headers_file="$2"
+    local body_file="$3"
+    local console_annotator="${4:-}"
+    local url="${JENKINS_URL}${endpoint}"
+
+    if [[ -n "$console_annotator" ]]; then
+        curl -s -f -g -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" \
+            -H "X-ConsoleAnnotator: ${console_annotator}" \
+            -D "$headers_file" -o "$body_file" "$url"
+    else
+        curl -s -f -g -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" \
+            -D "$headers_file" -o "$body_file" "$url"
+    fi
+}
+
 # Verify Jenkins connectivity and authentication
 # Tests connection to Jenkins root API endpoint
 # Returns: 0 on success, 1 on failure (with error logged)
@@ -277,12 +299,296 @@ get_build_info() {
     jenkins_api "${job_path}/${build_number}/api/json" 2>/dev/null || echo ""
 }
 
+# =============================================================================
+# Session console cache (build monitoring)
+# =============================================================================
+# Every monitor poll reads the console logs of the build and of each
+# downstream build. Downloading them whole on each poll costs tens of MB on a
+# large monorepo build and stretches a 5s poll to minutes, which delays
+# noticing that the build has finished. While BUILDGIT_CONSOLE_CACHE_DIR is
+# set, get_console_output/get_console_html read through this cache instead:
+#   - a finished build's log is downloaded once and reused for the session;
+#   - a running build's log is extended with logText/progressive{Text,Html}
+#     ?start=N, so a poll downloads only what was appended since the last one;
+#   - within one poll iteration (BUILDGIT_ITER_CACHE_DIR) each log is
+#     refreshed at most once.
+# Jenkins behavior this relies on (verified against a live Jenkins):
+#   - progressiveText sends raw log bytes, with ConsoleNotes embedded and each
+#     "\n" sent as "\r\n". Stripping the notes and the trailing "\r" of each
+#     line reproduces consoleText byte for byte.
+#   - For a running pipeline build, progressiveText returns at most 10000
+#     lines per request but reports X-Text-Size at the END of the log, so the
+#     next offset is computed from the body (bytes - lines), never taken from
+#     that header.
+#   - progressiveHtml is capped the same way, but its X-Text-Size is the true
+#     offset reached, and X-ConsoleAnnotator carries annotator state (node
+#     spans, ANSI colors) into the next request.
+#   - X-More-Data: true is sent while the log can still grow.
+
+# A response that stops short of X-Text-Size is treated as line-capped only
+# when it carries at least this many lines (Jenkins caps at 10000).
+_CONSOLE_PROGRESSIVE_MIN_CAPPED_LINES=1000
+
+_console_session_cache_begin() {
+    _console_session_cache_end
+    BUILDGIT_CONSOLE_CACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/buildgit-console-cache.XXXXXX")"
+    export BUILDGIT_CONSOLE_CACHE_DIR
+}
+
+_console_session_cache_end() {
+    if [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" ]]; then
+        rm -rf "$BUILDGIT_CONSOLE_CACHE_DIR" 2>/dev/null || true
+        unset BUILDGIT_CONSOLE_CACHE_DIR
+    fi
+}
+
+# Print the value of one response header (last occurrence, case-insensitive).
+# Usage: _progressive_header headers_file "X-Text-Size"
+_progressive_header() {
+    local headers_file="$1"
+    local header_name="$2"
+
+    tr -d '\r' < "$headers_file" 2>/dev/null | awk -v name="$header_name" '
+        BEGIN { name = tolower(name) }
+        {
+            i = index($0, ":")
+            if (i > 0 && tolower(substr($0, 1, i - 1)) == name) {
+                value = substr($0, i + 1)
+                sub(/^[ \t]+/, "", value)
+            }
+        }
+        END { print value }
+    '
+}
+
+# Convert progressiveText output to consoleText form (see quirks above).
+_console_strip_progressive_text() {
+    LC_ALL=C sed $'s/\x1b\\[8mha:[^\x1b]*\x1b\\[0m//g; s/\r$//'
+}
+
+# Append newly available text-log bytes to "$base".
+# Usage: _console_session_refresh_text job_path build_number base
+# Returns: 0 when the cache is consistent with Jenkins, 1 on fetch failure
+_console_session_refresh_text() {
+    local job_path="$1"
+    local build_number="$2"
+    local base="$3"
+    local headers="${base}.hdr"
+    local body="${base}.body"
+    local offset
+    offset=$(cat "${base}.offset" 2>/dev/null) || offset=0
+    [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+
+    local rounds=0
+    while [[ $rounds -lt 200 ]]; do
+        rounds=$((rounds + 1))
+        if ! jenkins_api_progressive "${job_path}/${build_number}/logText/progressiveText?start=${offset}" "$headers" "$body"; then
+            rm -f "$headers" "$body"
+            return 1
+        fi
+        local text_size more_data body_lines commit_bytes
+        text_size=$(_progressive_header "$headers" "X-Text-Size")
+        more_data=$(_progressive_header "$headers" "X-More-Data")
+        if [[ ! "$text_size" =~ ^[0-9]+$ ]]; then
+            rm -f "$headers" "$body"
+            return 1
+        fi
+        if [[ "$text_size" -lt "$offset" ]]; then
+            # The log shrank (build replaced?) - start over from scratch.
+            : > "$base"
+            offset=0
+            echo "$offset" > "${base}.offset"
+            continue
+        fi
+        body_lines=$(wc -l < "$body" | tr -d ' ')
+        local partial_tail=false
+        if [[ "$more_data" == "true" && -s "$body" && -n "$(tail -c 1 "$body")" ]]; then
+            # A running build's last line may still be growing; commit whole
+            # lines only and pick the rest up on a later poll.
+            partial_tail=true
+            head -n "$body_lines" "$body" > "${body}.lines"
+            mv "${body}.lines" "$body"
+        fi
+        commit_bytes=$(wc -c < "$body" | tr -d ' ')
+        local next_offset=$((offset + commit_bytes - body_lines))
+        # An uncapped response ends exactly at X-Text-Size. Falling short is
+        # expected only for a partial last line or a line-capped response;
+        # anything else means the offset model does not hold for this log,
+        # so drop the entry and let the caller fetch consoleText whole.
+        if [[ "$next_offset" -gt "$text_size" ]] \
+            || { [[ "$next_offset" -lt "$text_size" && "$partial_tail" != "true" ]] \
+                 && [[ "$body_lines" -lt "$_CONSOLE_PROGRESSIVE_MIN_CAPPED_LINES" ]]; }; then
+            rm -f "$base" "${base}.offset" "$headers" "$body"
+            : > "${base}.nocache"
+            return 1
+        fi
+        if [[ "$commit_bytes" -gt 0 ]]; then
+            _console_strip_progressive_text < "$body" >> "$base"
+        fi
+        offset="$next_offset"
+        echo "$offset" > "${base}.offset"
+        rm -f "$headers" "$body"
+        if [[ "$more_data" != "true" && "$offset" -eq "$text_size" ]]; then
+            : > "${base}.done"
+            break
+        fi
+        # Keep reading only while a capped response stopped short of the end.
+        if [[ "$partial_tail" == "true" || "$commit_bytes" -eq 0 || "$offset" -ge "$text_size" ]]; then
+            break
+        fi
+    done
+    return 0
+}
+
+# Append newly available annotated-HTML log to "$base".
+# Usage: _console_session_refresh_html job_path build_number base
+# Returns: 0 when the cache is consistent with Jenkins, 1 on fetch failure
+_console_session_refresh_html() {
+    local job_path="$1"
+    local build_number="$2"
+    local base="$3"
+    local headers="${base}.hdr"
+    local body="${base}.body"
+    local offset annotator
+    offset=$(cat "${base}.offset" 2>/dev/null) || offset=0
+    [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+    annotator=$(cat "${base}.annotator" 2>/dev/null) || annotator=""
+
+    local rounds=0
+    while [[ $rounds -lt 200 ]]; do
+        rounds=$((rounds + 1))
+        if ! jenkins_api_progressive "${job_path}/${build_number}/logText/progressiveHtml?start=${offset}" "$headers" "$body" "$annotator"; then
+            rm -f "$headers" "$body"
+            return 1
+        fi
+        local text_size more_data
+        text_size=$(_progressive_header "$headers" "X-Text-Size")
+        more_data=$(_progressive_header "$headers" "X-More-Data")
+        if [[ ! "$text_size" =~ ^[0-9]+$ ]]; then
+            rm -f "$headers" "$body"
+            return 1
+        fi
+        if [[ "$text_size" -lt "$offset" ]]; then
+            : > "$base"
+            offset=0
+            annotator=""
+            echo "$offset" > "${base}.offset"
+            rm -f "${base}.annotator"
+            continue
+        fi
+        if [[ "$more_data" == "true" && -s "$body" ]]; then
+            # Each chunk ends with the closing tag of its last node span. A
+            # chunk ending mid-line cannot be resumed at a known offset, so
+            # it is dropped and re-read on a later poll.
+            local chunk_tail
+            chunk_tail=$(tail -c 32 "$body"; printf 'x')
+            chunk_tail="${chunk_tail%x}"
+            while [[ "$chunk_tail" == *"</span>" ]]; do
+                chunk_tail="${chunk_tail%</span>}"
+            done
+            if [[ "$chunk_tail" != *$'\n' ]]; then
+                rm -f "$headers" "$body"
+                break
+            fi
+        fi
+        cat "$body" >> "$base"
+        local advanced=true
+        [[ "$text_size" -eq "$offset" ]] && advanced=false
+        offset="$text_size"
+        echo "$offset" > "${base}.offset"
+        annotator=$(_progressive_header "$headers" "X-ConsoleAnnotator")
+        if [[ -n "$annotator" ]]; then
+            printf '%s' "$annotator" > "${base}.annotator"
+        fi
+        rm -f "$headers" "$body"
+        if [[ "$more_data" != "true" ]]; then
+            : > "${base}.done"
+            break
+        fi
+        [[ "$advanced" == "true" ]] || break
+    done
+    return 0
+}
+
+# Return 0 when the session cache already holds the complete (final) text log
+# of a build, i.e. Jenkins reported the build finished when it was fetched.
+# Usage: _console_session_log_complete "job-name" "build-number"
+_console_session_log_complete() {
+    local job_name="$1"
+    local build_number="$2"
+    [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" ]] || return 1
+    local safe_job_name
+    safe_job_name=$(printf '%s' "$job_name" | tr '/ ' '__')
+    [[ -f "${BUILDGIT_CONSOLE_CACHE_DIR}/text_${safe_job_name}_${build_number}.done" ]]
+}
+
+_console_session_cache_is_fresh() {
+    local base="$1"
+    local iter_marker="$2"
+    [[ -f "${base}.done" ]] || [[ -n "$iter_marker" && -f "$iter_marker" ]]
+}
+
+# Read a build log through the session cache.
+# Usage: _console_session_cache_get text|html "job-name" "build-number"
+# Returns: 0 with the log on stdout, 1 (no output) when the caller should
+#          fall back to an uncached full fetch
+_console_session_cache_get() {
+    local kind="$1"
+    local job_name="$2"
+    local build_number="$3"
+    [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" && -d "$BUILDGIT_CONSOLE_CACHE_DIR" ]] || return 1
+
+    local job_path
+    job_path=$(jenkins_job_path "$job_name")
+    [[ -n "$job_path" ]] || return 1
+
+    local safe_job_name base iter_marker=""
+    safe_job_name=$(printf '%s' "$job_name" | tr '/ ' '__')
+    base="${BUILDGIT_CONSOLE_CACHE_DIR}/${kind}_${safe_job_name}_${build_number}"
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" && -d "$BUILDGIT_ITER_CACHE_DIR" ]]; then
+        iter_marker="${BUILDGIT_ITER_CACHE_DIR}/console_fresh_${kind}_${safe_job_name}_${build_number}"
+    fi
+    # Set when this log broke the progressive offset model; fetch it whole.
+    [[ -f "${base}.nocache" ]] && return 1
+
+    if ! _console_session_cache_is_fresh "$base" "$iter_marker"; then
+        # Background fetchers (parallel nested-stage expansion) can refresh
+        # the same log concurrently; serialize with a mkdir lock.
+        local waited=0
+        while ! mkdir "${base}.lock" 2>/dev/null; do
+            if [[ $waited -ge 300 ]]; then
+                return 1
+            fi
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+        if ! _console_session_cache_is_fresh "$base" "$iter_marker"; then
+            touch "$base"
+            if ! "_console_session_refresh_${kind}" "$job_path" "$build_number" "$base"; then
+                rmdir "${base}.lock" 2>/dev/null || true
+                return 1
+            fi
+            if [[ -n "$iter_marker" ]]; then
+                : > "$iter_marker"
+            fi
+        fi
+        rmdir "${base}.lock" 2>/dev/null || true
+    fi
+
+    cat "$base" 2>/dev/null || true
+    return 0
+}
+
 # Get console text output for a build
 # Usage: get_console_output "job-name" "build-number"
 # Returns: Console text, empty string on failure
 get_console_output() {
     local job_name="$1"
     local build_number="$2"
+    if [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" ]] \
+        && _console_session_cache_get text "$job_name" "$build_number"; then
+        return 0
+    fi
     local job_path
     job_path=$(jenkins_job_path "$job_name")
     if [[ -z "$job_path" ]]; then
@@ -324,6 +630,10 @@ get_console_output_cached() {
 get_console_html() {
     local job_name="$1"
     local build_number="$2"
+    if [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" ]] \
+        && _console_session_cache_get html "$job_name" "$build_number"; then
+        return 0
+    fi
     local job_path
     job_path=$(jenkins_job_path "$job_name")
     if [[ -z "$job_path" ]]; then

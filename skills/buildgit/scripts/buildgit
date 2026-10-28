@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-BUILDGIT_VERSION="1.4.10-dev"
+BUILDGIT_VERSION="1.4.11-dev"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/jenkins-common.sh"
@@ -21,7 +21,8 @@ _LINE_FORMAT_STRING="${_DEFAULT_LINE_FORMAT}"
 _THREADS_FORMAT="${BUILDGIT_THREADS_FORMAT:-${_DEFAULT_THREADS_FORMAT}}"
 
 POLL_INTERVAL="${POLL_INTERVAL:-5}"
-MAX_BUILD_TIME="${MAX_BUILD_TIME:-1800}"
+# Max seconds to monitor a build; 0 (default) waits until the build finishes
+MAX_BUILD_TIME="${MAX_BUILD_TIME:-0}"
 MONITOR_SETTLE_MAX_SECONDS="${MONITOR_SETTLE_MAX_SECONDS:-45}"
 MONITOR_SETTLE_STABLE_POLLS="${MONITOR_SETTLE_STABLE_POLLS:-3}"
 _PROGRESS_BAR_LINE_COUNT=0
@@ -35,6 +36,7 @@ _follow_mode_cleanup() {
     if [[ -n "${_FOLLOW_JOB_NAME:-}" ]]; then
         bg_log_essential "Resume monitoring with: buildgit status -f -j ${_FOLLOW_JOB_NAME}"
     fi
+    _console_session_cache_end
     exit 130
 }
 
@@ -75,6 +77,9 @@ cmd_passthrough() {
 }
 
 main() {
+    # Monitoring keeps a temporary console-log cache; remove it however we exit.
+    trap '_console_session_cache_end' EXIT
+
     parse_global_options "$@"
 
     # If no command provided, show usage and exit

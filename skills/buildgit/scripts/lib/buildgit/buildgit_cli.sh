@@ -104,6 +104,8 @@ Environment Variables:
   JENKINS_URL         Base URL of the Jenkins server
   JENKINS_USER_ID     Jenkins username for API authentication
   JENKINS_API_TOKEN   Jenkins API token for authentication
+  MAX_BUILD_TIME      Max seconds to monitor a running build before giving up
+                      (default: 0 = wait until the build finishes)
 EOF
 }
 

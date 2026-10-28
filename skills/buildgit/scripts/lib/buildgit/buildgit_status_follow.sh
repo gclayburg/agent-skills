@@ -148,7 +148,7 @@ _cmd_status_follow() {
                 fi
             elif [[ "$json_mode" == "true" && "$once_mode" == "true" ]]; then
                 local elapsed=0
-                while [[ $elapsed -lt $MAX_BUILD_TIME ]]; do
+                while [[ $MAX_BUILD_TIME -le 0 || $elapsed -lt $MAX_BUILD_TIME ]]; do
                     build_json=$(get_build_info "$job_name" "$build_number")
                     if [[ -z "$build_json" ]]; then
                         sleep "$POLL_INTERVAL"

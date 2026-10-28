@@ -498,7 +498,54 @@ _detect_parallel_branch_agent_from_blue_ocean() {
 # Get nested stages for a build, recursively expanding downstream builds
 # Usage: _get_nested_stages "job-name" "build-number" [prefix] [nesting_depth] [parent_stage] [parallel_path]
 # Returns: JSON array of stage objects with nested stage metadata
+# Memoized while monitoring: the expansion re-parses multi-MB console logs
+# once per stage, so the result is reused within a poll iteration (the
+# --threads rows need the same expansion as the stage tracker) and, for a
+# finished downstream build, for the rest of the session. The monitored
+# (top-level) build is never session-memoized: the completion settle passes
+# rely on re-reading it while Jenkins finalizes late stage metadata.
 _get_nested_stages() {
+    local job_name="$1"
+    local build_number="$2"
+    local nesting_depth="${4:-0}"
+    local memo_key="" iter_memo="" session_memo=""
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" || -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" ]]; then
+        memo_key="nested_$(printf '%s\x1f' "$@" | cksum | tr -d ' \t')"
+    fi
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" && -d "$BUILDGIT_ITER_CACHE_DIR" ]]; then
+        iter_memo="${BUILDGIT_ITER_CACHE_DIR}/${memo_key}"
+        if [[ -f "$iter_memo" ]]; then
+            cat "$iter_memo"
+            return 0
+        fi
+    fi
+    # Only a build whose log was already complete BEFORE this expansion
+    # started is final; one finishing midway may have been read part-way.
+    if [[ "$nesting_depth" != "0" ]] \
+        && [[ -n "${BUILDGIT_CONSOLE_CACHE_DIR:-}" && -d "$BUILDGIT_CONSOLE_CACHE_DIR" ]] \
+        && _console_session_log_complete "$job_name" "$build_number"; then
+        session_memo="${BUILDGIT_CONSOLE_CACHE_DIR}/${memo_key}"
+        if [[ -f "$session_memo" ]]; then
+            cat "$session_memo"
+            return 0
+        fi
+    fi
+
+    local result
+    result=$(_get_nested_stages_uncached "$@")
+    if [[ -n "$result" && "$result" != "[]" ]]; then
+        [[ -n "$iter_memo" ]] && printf '%s\n' "$result" > "$iter_memo"
+        if [[ -n "$session_memo" ]] && printf '%s\n' "$result" | jq -e '
+                all(.[]?; (.status // "") as $s
+                    | ["SUCCESS", "FAILED", "UNSTABLE", "ABORTED", "NOT_EXECUTED"] | index($s) != null)
+            ' >/dev/null 2>&1; then
+            printf '%s\n' "$result" > "$session_memo"
+        fi
+    fi
+    printf '%s\n' "$result"
+}
+
+_get_nested_stages_uncached() {
     local job_name="$1"
     local build_number="$2"
     local prefix="${3:-}"
@@ -595,6 +642,8 @@ _get_nested_stages() {
         done < <(echo "$stages_json" | jq -r '.[]?.name // empty' 2>/dev/null)
 
         local stage_count_for_parallel=${#_ns_names[@]}
+        local console_structure
+        console_structure=$(_console_pipeline_structure "$console_output")
         local _pw_fsep=$'\x1f'  # Unit Separator — between fields within a record
         local _pw_rsep=$'\x1e'  # Record Separator — between records
         local _pw_input=""
@@ -602,7 +651,7 @@ _get_nested_stages() {
         while [[ $pi -lt $stage_count_for_parallel ]]; do
             local pi_stage_name="${_ns_names[$pi]}"
             local branches
-            branches=$(_detect_parallel_branches "$console_output" "$pi_stage_name")
+            branches=$(_detect_parallel_branches "$console_structure" "$pi_stage_name")
             if [[ -n "$branches" && "$branches" != "[]" ]]; then
                 local branch_substages
                 branch_substages=$(_detect_branch_substages "$console_output" "$pi_stage_name")

@@ -158,6 +158,26 @@ _buildgit_iter_cache_end() {
     fi
 }
 
+# Return 0 when a poll iteration has already run for at least POLL_INTERVAL
+# and Jenkins now reports the build finished. On a large build the stage
+# tracker and --threads rows can take longer than a poll, so this re-check
+# reports completion without first finishing the rest of the iteration and
+# sleeping.
+# Usage: _monitor_build_finished_mid_iteration job build iter_start_seconds
+#   iter_start_seconds: value of $SECONDS when the iteration began
+_monitor_build_finished_mid_iteration() {
+    local job_name="$1"
+    local build_number="$2"
+    local iter_start_seconds="$3"
+    if [[ $((SECONDS - iter_start_seconds)) -lt $POLL_INTERVAL ]]; then
+        return 1
+    fi
+    local info
+    info=$(get_build_info "$job_name" "$build_number")
+    [[ -n "$info" ]] || return 1
+    [[ "$(echo "$info" | jq -r 'if .building == false and (.result // "") != "" then "done" else "" end' 2>/dev/null)" == "done" ]]
+}
+
 _buildgit_timing_ms() {
     local start="$1"
     local finish="$2"
@@ -206,9 +226,13 @@ __buildgit_monitor_build_impl() {
     local stage_state="${_BANNER_STAGES_JSON:-[]}"
     _BANNER_STAGES_JSON=""  # Reset after reading
 
+    # Cache console logs across polls: finished builds are fetched once and
+    # running ones incrementally. Kept through _handle_build_completion.
+    _console_session_cache_begin
+
     bg_log_info "Monitoring build #${build_number}..."
 
-    while [[ $elapsed -lt $MAX_BUILD_TIME ]]; do
+    while [[ $MAX_BUILD_TIME -le 0 || $elapsed -lt $MAX_BUILD_TIME ]]; do
         iter_num=$((iter_num + 1))
         local iter_start=""
         local build_info_start=""
@@ -216,6 +240,7 @@ __buildgit_monitor_build_impl() {
         local build_info_ms=0
         local stage_track_ms=0
         iter_start=$(date +%s)
+        local iter_start_seconds=$SECONDS
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
             build_info_start="$iter_start"
         fi
@@ -237,6 +262,7 @@ __buildgit_monitor_build_impl() {
                 rm -f "$stage_log_file" 2>/dev/null || true
                 rm -f "$stage_state_file" 2>/dev/null || true
                 rm -f "$deferred_log_file" 2>/dev/null || true
+                _console_session_cache_end
                 bg_log_error "Too many consecutive API failures ($consecutive_failures)"
                 return 1
             fi
@@ -542,6 +568,7 @@ __buildgit_monitor_build_impl() {
                 rm -f "$stage_log_file" 2>/dev/null || true
                 rm -f "$stage_state_file" 2>/dev/null || true
                 rm -f "$deferred_log_file" 2>/dev/null || true
+                _console_session_cache_end
                 return "$BUILDGIT_EXIT_BAILED_ON_RED"
             fi
         fi
@@ -591,13 +618,26 @@ __buildgit_monitor_build_impl() {
             bg_log_progress "Build in progress... (${elapsed}s elapsed)"
         fi
 
-        if [[ "$render_progress" == "true" ]]; then
+        # A slow iteration re-checks for completion before rendering progress
+        # (and --threads rows) and sleeping; the top of the loop then reports
+        # it straight away.
+        local skip_rest_of_iteration=false
+        if _monitor_build_finished_mid_iteration "$job_name" "$build_number" "$iter_start_seconds"; then
+            skip_rest_of_iteration=true
+        fi
+
+        if [[ "$render_progress" == "true" && "$skip_rest_of_iteration" != "true" ]]; then
             local stages_json=""
             if [[ "$THREADS_MODE" == "true" ]]; then
                 stages_json=$(_get_follow_active_stages "$job_name" "$build_number")
+                if _monitor_build_finished_mid_iteration "$job_name" "$build_number" "$iter_start_seconds"; then
+                    skip_rest_of_iteration=true
+                fi
             fi
-            _display_follow_line_progress "$job_name" "$build_number" "$build_info" "$estimate_ms" "$line_frame" "$include_queue_lines" "$stages_json"
-            showed_progress=true
+            if [[ "$skip_rest_of_iteration" != "true" ]]; then
+                _display_follow_line_progress "$job_name" "$build_number" "$build_info" "$estimate_ms" "$line_frame" "$include_queue_lines" "$stages_json"
+                showed_progress=true
+            fi
         fi
 
         _buildgit_iter_cache_end
@@ -613,7 +653,7 @@ __buildgit_monitor_build_impl() {
         if [[ $iter_cost -lt 0 ]]; then
             iter_cost=0
         fi
-        if [[ $iter_cost -lt $POLL_INTERVAL ]]; then
+        if [[ $iter_cost -lt $POLL_INTERVAL && "$skip_rest_of_iteration" != "true" ]]; then
             sleep_secs=$((POLL_INTERVAL - iter_cost))
             sleep "$sleep_secs"
         fi
@@ -633,6 +673,7 @@ __buildgit_monitor_build_impl() {
     rm -f "$stage_log_file" 2>/dev/null || true
     rm -f "$stage_state_file" 2>/dev/null || true
     rm -f "$deferred_log_file" 2>/dev/null || true
+    _console_session_cache_end
     bg_log_error "Build timeout: exceeded ${MAX_BUILD_TIME} seconds"
     bg_log_info "Build may still be running - check Jenkins console"
     return 1

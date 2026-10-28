@@ -146,13 +146,20 @@ _build_parallel_tracking_state() {
                 | ($we.value.status // "") as $wstatus
                 | ($we.value.durationMillis // null) as $wdur
                 | is_terminal($wstatus) as $wrapper_terminal
+                # A branch skipped by a `when` condition reports NOT_EXECUTED
+                # forever. Once the wrapper itself is terminal every branch is
+                # done, so a skipped branch must not hold the wrapper (and,
+                # via the predecessor gate, every later stage) until the
+                # final building=false flush.
+                | ($branch_entries
+                   | map(select(($wrapper_terminal and ((.status // "") == "NOT_EXECUTED")) | not))) as $gating_entries
                 | ($branch_entries | map(.name)) as $branch_names
                 | any([ $nested | to_entries[]
                         | select(.key >= $scan_start and .key < $wrapper_idx)
                         | .value.name ]
                       | . as $n
                       | ($branch_names | index($n) | not)) as $has_extra_span_stages
-                | (reduce ($branch_entries[]) as $be (
+                | (reduce ($gating_entries[]) as $be (
                     { state: {}, all_terminal: true, all_ready: true };
                     .state as $bs
                     | $be.name as $bname
@@ -167,7 +174,7 @@ _build_parallel_tracking_state() {
                     | (($prev_bstatus != null)
                        and ((is_terminal($prev_bstatus)) | not)
                        and is_terminal($bstatus)) as $terminal_transition
-                    | (all($branch_entries[]?;
+                    | (all($gating_entries[]?;
                            is_terminal(.status // "")
                            and is_nonneg_int(.durationMillis // null)
                            and ((.durationMillis // 0) >= 1000 or $building == "false")

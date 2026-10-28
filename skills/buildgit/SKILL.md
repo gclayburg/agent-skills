@@ -148,6 +148,7 @@ Threads placeholders are separate from `--format` placeholders:
 `%a`=agent `%S`=stage `%g`=progress-bar `%p`=percent `%e`=elapsed `%E`=estimate `%%`=literal%
 Use width/alignment like `%14a` or `%-14a`. `BUILDGIT_THREADS_FORMAT` sets the default when `--threads` has no explicit format argument.
 Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-loop iteration while using `push`, `build`, or `status -f`.
+`push`, `build`, and `status -f` wait until the build finishes, however long it runs. To cap monitoring, set `MAX_BUILD_TIME` to a number of seconds (e.g. `MAX_BUILD_TIME=3600 scripts/buildgit push`); when the cap is reached buildgit exits 1 with a timeout error, but the Jenkins build keeps running and can be picked up again with `status -f`. `0` (the default) means no limit.
 
 ## Interpreting Output
 
