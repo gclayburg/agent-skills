@@ -459,7 +459,7 @@ _status_line_for_build_json() {
     tests_fail_count=""
     if [[ "$no_tests" != "true" ]]; then
         local test_results_json passed failed skipped test_results_rc=0
-        if test_results_json=$(fetch_test_results "$job_name" "$build_number"); then
+        if test_results_json=$(fetch_test_results "$job_name" "$build_number" "counts"); then
             test_results_rc=0
         else
             test_results_rc=$?
@@ -478,20 +478,19 @@ _status_line_for_build_json() {
             fi
 
             if [[ -n "$downstream_lines" ]]; then
-                local collected_results collected_rc=0 totals
-                if collected_results=$(collect_downstream_test_results "$job_name" "$build_number" "$console_output"); then
+                local collected_rc=0 totals
+                if totals=$(collect_downstream_test_totals "$job_name" "$build_number" "$console_output" "$test_results_json"); then
                     collected_rc=0
                 else
                     collected_rc=$?
-                    collected_results=""
+                    totals=""
                 fi
 
                 if [[ "$collected_rc" -eq 2 ]]; then
                     tests_display="!err!"
                     tests_comm_error=true
                     _note_test_results_comm_failure "$job_name" "$build_number"
-                elif [[ -n "$collected_results" ]]; then
-                    totals=$(aggregate_test_totals "$collected_results")
+                elif [[ -n "$totals" ]]; then
                     passed=$(echo "$totals" | sed -n '2p')
                     failed=$(echo "$totals" | sed -n '3p')
                     skipped=$(echo "$totals" | sed -n '4p')

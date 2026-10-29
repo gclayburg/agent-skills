@@ -459,6 +459,117 @@ _stage_deferred_by_unstable_parallel_wrapper() {
     return 1
 }
 
+# Print the stage names whose console structure has not caught up with wfapi.
+# wfapi marks a parallel wrapper, and a branch holding nested stages{}, as
+# SUCCESS (<1s) the moment its first child stage starts. Only the console's
+# "[Pipeline] parallel" / "(Branch: X)" lines identify them as parallel, and
+# the console can lag wfapi by a poll. Until it catches up such a stage looks
+# like a finished plain stage. A name is unsettled when its stage block is
+#   - open with a direct "[Pipeline] parallel" (branches not detected yet),
+#   - open with no child stage yet (a leaf wfapi already calls finished), or
+#   - absent while no later stage in the list is in the console either.
+# Prints nothing when the console carries no stage blocks at all.
+# Usage: _console_unsettled_stage_names "$console_structure" "$newline_separated_names"
+_console_unsettled_stage_names() {
+    local console_structure="$1"
+    local stage_names="$2"
+    [[ -n "$console_structure" && -n "$stage_names" ]] || return 0
+
+    printf '%s\n' "$console_structure" | BUILDGIT_UNSETTLED_NAMES="$stage_names" awk '
+        BEGIN {
+            name_count = split(ENVIRON["BUILDGIT_UNSETTLED_NAMES"], names, "\n")
+            top = 0
+            labeled_blocks = 0
+        }
+        function nearest_label(   i) {
+            for (i = top; i > 0; i--) {
+                if (stack[i] != "") return stack[i]
+            }
+            return ""
+        }
+        {
+            sub(/\r$/, "")
+            p = index($0, "[Pipeline] ")
+            if (p == 0) next
+            line = substr($0, p + 11)
+            if (line == "parallel") {
+                lbl = nearest_label()
+                if (lbl != "") has_parallel[lbl] = 1
+            } else if (substr(line, 1, 3) == "{ (" && substr(line, length(line), 1) == ")") {
+                lbl = substr(line, 4, length(line) - 4)
+                parent = nearest_label()
+                if (parent != "") has_child[parent] = 1
+                stack[++top] = lbl
+                seen[lbl] = 1
+                open[lbl] = 1
+                has_child[lbl] = 0
+                has_parallel[lbl] = 0
+                labeled_blocks++
+            } else if (line == "{") {
+                stack[++top] = ""
+            } else if (line == "}") {
+                if (top > 0) {
+                    if (stack[top] != "") open[stack[top]] = 0
+                    top--
+                }
+            }
+        }
+        END {
+            if (labeled_blocks == 0) exit
+            later_seen = 0
+            for (i = name_count; i >= 1; i--) {
+                name = names[i]
+                if (name == "") continue
+                if (!(name in seen)) {
+                    if (!later_seen) print name
+                    continue
+                }
+                later_seen = 1
+                if (open[name] && (has_parallel[name] || !has_child[name])) print name
+            }
+        }
+    '
+}
+
+# Return 0 when a terminal top-level stage on the plain print path must wait
+# because the console has not caught up with wfapi (see
+# _console_unsettled_stage_names). Without this, a parallel wrapper and its
+# stages{} branches print as finished plain stages (<1s) on the poll where
+# wfapi lists them but the console lacks their parallel structure, and their
+# real ║N summaries are never printed afterwards. A finished build (building
+# false) prints without waiting.
+# Inputs (tracker locals): _ts_names, _ts_parallel_wrapper, parallel_state,
+#   job_name, build_number, _ts_unsettled_loaded, _ts_unsettled_names
+_stage_awaits_console_structure() {
+    local stage_index="$1"
+    local stage_name="${_ts_names[$stage_index]}"
+
+    [[ "$stage_name" == *"->"* || -n "${_ts_parallel_wrapper[$stage_index]}" ]] && return 1
+
+    if [[ "$_ts_unsettled_loaded" != "true" ]]; then
+        _ts_unsettled_loaded=true
+        _ts_unsettled_names=""
+        local building
+        building=$(echo "$parallel_state" | jq -r '.__buildgit_building // "true"' 2>/dev/null) || building="true"
+        if [[ "$building" != "false" ]]; then
+            local console_output top_level_names="" _ua_name
+            console_output=$(get_console_output_cached "$job_name" "$build_number" 2>/dev/null) || console_output=""
+            for _ua_name in "${_ts_names[@]}"; do
+                [[ "$_ua_name" == *"->"* ]] && continue
+                top_level_names+="${_ua_name}"$'\n'
+            done
+            _ts_unsettled_names=$(_console_unsettled_stage_names \
+                "$(_console_pipeline_structure "$console_output")" "$top_level_names")
+        fi
+    fi
+
+    [[ -n "$_ts_unsettled_names" ]] || return 1
+    case $'\n'"${_ts_unsettled_names}"$'\n' in
+        *$'\n'"${stage_name}"$'\n'*) return 0 ;;
+    esac
+    return 1
+}
+
 _stage_blocked_by_unprinted_predecessor_fast() {
     local current_index="$1"
     local stage_group="${_ts_group[$current_index]}"
@@ -799,6 +910,8 @@ _track_nested_stage_changes() {
     [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3b=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
 
     local stage_count=${#_ts_names[@]}
+    # Filled on first use by _stage_awaits_console_structure (once per poll).
+    local _ts_unsettled_loaded=false _ts_unsettled_names=""
     # Diagnostic counters (emitted under BUILDGIT_DEBUG_TIMING) so we can tell
     # whether stages are held back by blocking predecessors, unready parallel
     # wrappers, or unready parallel branches — the three reasons a completed
@@ -910,6 +1023,9 @@ _track_nested_stage_changes() {
                         fi
                     fi
                     if [[ "$allow_print" == "true" ]] && _stage_deferred_by_unstable_parallel_wrapper "$i"; then
+                        allow_print=false
+                    fi
+                    if [[ "$allow_print" == "true" ]] && _stage_awaits_console_structure "$i"; then
                         allow_print=false
                     fi
                     if [[ "$allow_print" == "true" ]]; then

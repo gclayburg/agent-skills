@@ -33,12 +33,15 @@ display_test_results_comm_error() {
 }
 
 # Fetch test results from Jenkins test report API
-# Usage: fetch_test_results "job-name" "build-number"
+# Usage: fetch_test_results "job-name" "build-number" ["counts"]
+#        "counts" fetches only passCount/failCount/skipCount: a few bytes
+#        instead of every test case, which runs to megabytes on large suites.
 # Returns: JSON test report on success, empty string if not available
 # Spec: test-failure-display-spec.md, Section: Test Report Detection (1.1-1.2)
 fetch_test_results() {
     local job_name="$1"
     local build_number="$2"
+    local mode="${3:-}"
     local job_path
     job_path=$(jenkins_job_path "$job_name")
     if [[ -z "$job_path" ]]; then
@@ -50,8 +53,13 @@ fetch_test_results() {
     local http_code
     local body
 
+    local endpoint="${job_path}/${build_number}/testReport/api/json"
+    if [[ "$mode" == "counts" ]]; then
+        endpoint="${endpoint}?tree=passCount,failCount,skipCount"
+    fi
+
     # Query the test report API
-    response=$(jenkins_api_with_status "${job_path}/${build_number}/testReport/api/json" || true)
+    response=$(jenkins_api_with_status "$endpoint" || true)
 
     # Split response into body and status code
     http_code=$(echo "$response" | tail -1)
@@ -343,6 +351,75 @@ collect_downstream_test_results() {
     local console_output="$3"
 
     _collect_downstream_test_results_recursive "$job_name" "$build_number" "$console_output" 0 "$job_name" "true"
+}
+
+# Emit "passed failed skipped" for a build and, recursively, for every
+# downstream build detected in its console. Used by collect_downstream_test_totals.
+# Arguments: job_name, build_number, console_output, is_root, [test_json]
+#            A 5th argument is the build's already-fetched test JSON.
+_collect_downstream_test_counts_recursive() {
+    local job_name="$1"
+    local build_number="$2"
+    local console_output="$3"
+    local is_root="$4"
+
+    local test_json="" fetch_rc=0
+    if [[ $# -ge 5 ]]; then
+        test_json="$5"
+    elif test_json=$(fetch_test_results "$job_name" "$build_number" "counts"); then
+        fetch_rc=0
+    else
+        fetch_rc=$?
+        test_json=""
+    fi
+
+    if [[ "$fetch_rc" -eq 2 && "$is_root" == "true" ]]; then
+        return 2
+    fi
+
+    if [[ -n "$test_json" ]]; then
+        printf '%s' "$test_json" | jq -r '"\(.passCount // 0) \(.failCount // 0) \(.skipCount // 0)"' 2>/dev/null || true
+    fi
+
+    local downstream_lines
+    downstream_lines=$(detect_all_downstream_builds "$console_output")
+    if [[ -z "$downstream_lines" ]]; then
+        return 0
+    fi
+
+    local downstream_job downstream_build downstream_console
+    while IFS=' ' read -r downstream_job downstream_build; do
+        [[ -z "$downstream_job" || -z "$downstream_build" ]] && continue
+        downstream_console=$(get_console_output "$downstream_job" "$downstream_build" 2>/dev/null || true)
+        _collect_downstream_test_counts_recursive \
+            "$downstream_job" "$downstream_build" "$downstream_console" "false"
+    done <<< "$downstream_lines"
+}
+
+# Sum test counts across a build and its downstream builds.
+# Gives the same totals as aggregate_test_totals over
+# collect_downstream_test_results, but fetches only the counts and skips the
+# stage-label mapping, so one-line rows of large monorepo builds take seconds
+# rather than tens of seconds.
+# Usage: collect_downstream_test_totals "job-name" "build-number" "console-output" ["root-test-json"]
+#        Pass root-test-json when the parent's report is already fetched.
+# Returns: Four lines on stdout: total_sum, passed_sum, failed_sum, skipped_sum
+# Exit code: 0 on success, 2 if the parent build had a communication error.
+collect_downstream_test_totals() {
+    local job_name="$1"
+    local build_number="$2"
+    local console_output="$3"
+
+    local counts
+    if [[ $# -ge 4 ]]; then
+        counts=$(_collect_downstream_test_counts_recursive "$job_name" "$build_number" "$console_output" "true" "$4") || return $?
+    else
+        counts=$(_collect_downstream_test_counts_recursive "$job_name" "$build_number" "$console_output" "true") || return $?
+    fi
+
+    printf '%s\n' "$counts" | awk '
+        NF == 3 { p += $1; f += $2; s += $3 }
+        END { printf "%d\n%d\n%d\n%d\n", p + f + s, p, f, s }'
 }
 
 # Aggregate totals across collected downstream test results.

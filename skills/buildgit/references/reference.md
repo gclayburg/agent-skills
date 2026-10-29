@@ -44,6 +44,16 @@ SUCCESS     #13 id=39ab12c Tests=19/0/0 Took 5m 02s on 2026-03-14T10:23:58-0700 
 
 `--probe-all` requires `-f`, rejects explicit branch jobs like `--job ralph1/main`, and falls back to normal single-job follow with a warning when the target job is not multibranch.
 
+When several branches have builds in progress at once (for example branches serialized by a shared pipeline-level `lock()`), probe-all follows a build that has started a stage over one still waiting before its first stage, and otherwise the oldest build.
+
+While following a branch of a multibranch job on a TTY (`status -f`, `push`, `build`), the progress area also lists the project's other branch builds: running ones (or `waiting to start` while blocked on the lock or an executor), then queued ones, oldest first:
+
+```
+IN_PROGRESS Job phandlemono/PH0306-domain-service-it-thread-leak #2 [========>           ] 49% 14m 45s / ~30m 0s
+IN_PROGRESS Job phandlemono/PH0285-gateway-owner-agent-inbox #7 [<===>               ] waiting to start 28m 56s / ~30m 0s
+QUEUED      Job phandlemono/PH0293-owner-statements-bulk-send #11 [<===>               ] 3m 2s in queue / ~30m 0s
+```
+
 If Jenkins becomes unreachable while probe-all is waiting, it keeps retrying and reports the outage on stderr (once per burst, then once per 12 consecutive failed polls) rather than latching onto a stale build:
 
 ```

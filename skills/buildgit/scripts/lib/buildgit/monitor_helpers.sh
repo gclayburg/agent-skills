@@ -814,7 +814,9 @@ _follow_wait_for_new_build_timeout() {
     done
 }
 
-_detect_probe_all_candidate() {
+# List every branch whose build number moved past its baseline, one
+# "branch build_number" line each, sorted by branch name.
+_list_probe_all_candidates() {
     local baselines_json="$1"
     local current_json="$2"
 
@@ -830,9 +832,63 @@ _detect_probe_all_candidate() {
         | to_entries
         | sort_by(.key)
         | map(select((.value > 0) and (($base[.key] // 0) < .value)))
-        | first // empty
+        | .[]
         | "\(.key) \(.value)"
     ' 2>/dev/null || true
+}
+
+_detect_probe_all_candidate() {
+    local candidates
+    candidates=$(_list_probe_all_candidates "$1" "$2")
+    if [[ -n "$candidates" ]]; then
+        echo "${candidates%%$'\n'*}"
+    fi
+}
+
+# Pick the build probe-all should follow when several branches qualify at
+# once. A build that is doing work (it has started a stage, or already
+# finished) beats one still waiting before its first stage for a lock or an
+# executor another branch holds; otherwise probe-all attaches to a stalled
+# build and hides the one actually running. Ties go to the oldest build,
+# which is first in line for the shared resource.
+# Arguments: top_job_name, raw_current (rich baselines JSON), candidates
+#            ("branch build_number" lines from _list_probe_all_candidates)
+# Prints the chosen "branch build_number" line.
+_select_probe_all_candidate() {
+    local top_job_name="$1"
+    local raw_current="$2"
+    local candidates="$3"
+
+    if [[ "$candidates" != *$'\n'* ]]; then
+        echo "$candidates"
+        return 0
+    fi
+
+    local best="" best_rank=0 best_ts=0
+    local line branch number info building ts rank
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        branch="${line%% *}"
+        number="${line##* }"
+        info=$(printf '%s\n' "$raw_current" | jq -r --arg b "$branch" '"\(.[$b].building // false) \(.[$b].timestamp // 0)"' 2>/dev/null) || info="false 0"
+        building="${info%% *}"
+        ts="${info##* }"
+        [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+        rank=0
+        if [[ "$building" == "true" ]]; then
+            _resolve_follow_work_start "${top_job_name}/${branch}" "$number" "unavailable"
+            if [[ -z "$_FOLLOW_WORK_START_RESULT" ]]; then
+                rank=1
+            fi
+        fi
+        if [[ -z "$best" || "$rank" -lt "$best_rank" ]] || [[ "$rank" -eq "$best_rank" && "$ts" -lt "$best_ts" ]]; then
+            best="$line"
+            best_rank="$rank"
+            best_ts="$ts"
+        fi
+    done <<< "$candidates"
+
+    echo "$best"
 }
 
 # Convert rich baseline JSON { branch: { number, building } } to flat adjusted map.
@@ -932,7 +988,10 @@ _follow_wait_probe_all() {
         _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
         fetch_failures=0
         current=$(_flatten_probe_all_baselines "$raw_current")
-        detected=$(_detect_probe_all_candidate "$baselines" "$current")
+        detected=$(_list_probe_all_candidates "$baselines" "$current")
+        if [[ -n "$detected" ]]; then
+            detected=$(_select_probe_all_candidate "$top_job_name" "$raw_current" "$detected")
+        fi
 
         if [[ -n "$detected" ]]; then
             local branch build_number
@@ -993,7 +1052,10 @@ _follow_wait_probe_all_timeout() {
         _probe_all_log_fetch_recovery "$top_job_name" "$fetch_failures"
         fetch_failures=0
         current=$(_flatten_probe_all_baselines "$raw_current")
-        detected=$(_detect_probe_all_candidate "$baselines" "$current")
+        detected=$(_list_probe_all_candidates "$baselines" "$current")
+        if [[ -n "$detected" ]]; then
+            detected=$(_select_probe_all_candidate "$top_job_name" "$raw_current" "$detected")
+        fi
 
         if [[ -n "$detected" ]]; then
             local branch build_number
@@ -1084,6 +1146,11 @@ _display_n_prior_builds() {
         return 0
     fi
 
+    if [[ "$line_mode" == "true" ]]; then
+        _render_prior_build_lines "$job_name" "$no_tests"
+        return 0
+    fi
+
     # Display oldest first (reverse order of collection)
     local i
     for (( i=${#_PRIOR_COMPLETED_BUILD_NUMS[@]}-1; i>=0; i-- )); do
@@ -1096,6 +1163,62 @@ _display_n_prior_builds() {
             _display_completed_build "$job_name" "$bnum" "$bjson" || true
         fi
     done
+}
+
+# Print one-line rows for _PRIOR_COMPLETED_BUILD_NUMS, oldest first.
+# Each row can take seconds (console and test-count fetches across downstream
+# builds) and rows are independent, so up to BUILDGIT_PRIOR_ROWS_PARALLELISM
+# (default 4) are rendered at once; output order is unchanged.
+# Arguments: job_name, no_tests
+_render_prior_build_lines() {
+    local job_name="$1"
+    local no_tests="$2"
+    local max_jobs="${BUILDGIT_PRIOR_ROWS_PARALLELISM:-4}"
+    [[ "$max_jobs" =~ ^[1-9][0-9]*$ ]] || max_jobs=4
+
+    local i=$(( ${#_PRIOR_COMPLETED_BUILD_NUMS[@]} - 1 ))
+    if [[ "$i" -lt 0 ]]; then
+        return 0
+    fi
+
+    local work_dir=""
+    if [[ "$max_jobs" -gt 1 ]]; then
+        work_dir=$(mktemp -d "${TMPDIR:-/tmp}/buildgit-prior-rows.XXXXXX" 2>/dev/null) || work_dir=""
+    fi
+    if [[ -z "$work_dir" ]]; then
+        local bnum bjson
+        for (( ; i>=0; i-- )); do
+            bnum="${_PRIOR_COMPLETED_BUILD_NUMS[$i]}"
+            bjson=$(get_build_info "$job_name" "$bnum")
+            _status_line_for_build_json "$job_name" "$bnum" "$bjson" "$no_tests" || true
+        done
+        return 0
+    fi
+
+    # Wait on our own pids only: a bare `wait` would also block on any
+    # background helper the caller has running.
+    local j k pids
+    while [[ "$i" -ge 0 ]]; do
+        pids=""
+        j="$i"
+        while [[ "$j" -ge 0 && "$j" -gt $(( i - max_jobs )) ]]; do
+            (
+                bjson=$(get_build_info "$job_name" "${_PRIOR_COMPLETED_BUILD_NUMS[$j]}")
+                _status_line_for_build_json "$job_name" "${_PRIOR_COMPLETED_BUILD_NUMS[$j]}" "$bjson" "$no_tests" || true
+            ) > "${work_dir}/${j}.out" 2> "${work_dir}/${j}.err" &
+            pids="$pids $!"
+            j=$(( j - 1 ))
+        done
+        for k in $pids; do
+            wait "$k" 2>/dev/null || true
+        done
+        for (( k=i; k>j; k-- )); do
+            cat "${work_dir}/${k}.err" >&2
+            cat "${work_dir}/${k}.out"
+        done
+        i="$j"
+    done
+    rm -rf "$work_dir"
 }
 
 # Display the prior-jobs one-line block (header + rows) when rows exist.

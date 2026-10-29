@@ -75,12 +75,18 @@ _get_running_builds_for_progress() {
         '(map(select(.number == $pnum)) | sort_by(.number)) + (map(select(.number != $pnum)) | sort_by(.number))' 2>/dev/null || echo "[]"
 }
 
+# Arguments: job_name, max_running_build, [queue_response]
+# queue_response is the /queue/api/json body when the caller already fetched it.
 _get_queued_builds_for_progress() {
     local job_name="$1"
     local max_running_build="$2"
 
     local queue_response queued
-    queue_response=$(jenkins_api "/queue/api/json" 2>/dev/null) || true
+    if [[ $# -ge 3 ]]; then
+        queue_response="$3"
+    else
+        queue_response=$(jenkins_api "/queue/api/json" 2>/dev/null) || true
+    fi
     if [[ -z "$queue_response" ]]; then
         echo "[]"
         return 0
@@ -98,6 +104,76 @@ _get_queued_builds_for_progress() {
         | map(.value + {number: ($base + .key + 1)})
     ' 2>/dev/null) || queued="[]"
     echo "$queued"
+}
+
+# Builds of the other branches of a multibranch project, so a build waiting
+# behind a shared lock or executor stays visible while another branch runs.
+# Arguments: job_name (top/branch), max_running_build, [queue_response]
+# Prints a JSON array, running builds first (oldest first), then queued items
+# (oldest first): [{job, number, timestamp, queued, inQueueSince}]. job is the
+# branch job name. Queued items of job_name's own branch are included because
+# _get_queued_builds_for_progress matches the queue by plain job name only.
+# Prints [] when job_name is not a branch of a multibranch project.
+_get_sibling_branch_builds_for_progress() {
+    local job_name="$1"
+    local max_running_build="${2:-0}"
+    local queue_response="${3:-}"
+
+    if [[ "$job_name" != */* ]]; then
+        echo "[]"
+        return 0
+    fi
+    [[ "$max_running_build" =~ ^[0-9]+$ ]] || max_running_build=0
+
+    local top_job="${job_name%%/*}"
+    local branch="${job_name#*/}"
+    local top_path response
+    top_path=$(jenkins_job_path "$top_job")
+    if [[ -z "$top_path" ]]; then
+        echo "[]"
+        return 0
+    fi
+    response=$(jenkins_api "${top_path}/api/json?tree=jobs[name,lastBuild[number,building,timestamp]]" 2>/dev/null) || true
+    if [[ -z "$response" ]]; then
+        echo "[]"
+        return 0
+    fi
+    if ! printf '%s' "$queue_response" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        queue_response='{}'
+    fi
+
+    printf '%s\n' "$response" | jq -c \
+        --arg branch "$branch" \
+        --arg task_prefix "${top_path}/job/" \
+        --argjson base "$max_running_build" \
+        --argjson queue "$queue_response" '
+        if ((._class // "") | test("MultiBranch")) | not then []
+        else
+            ([.jobs[]? | {key: .name, value: (.lastBuild.number // 0)}] | from_entries) as $last
+            | ([.jobs[]?
+                | select(.name != $branch and (.lastBuild.building // false) == true)
+                | {job: .name, number: (.lastBuild.number // 0),
+                   timestamp: (.lastBuild.timestamp // 0), queued: false, inQueueSince: 0}]
+               | sort_by(.timestamp)) as $running
+            | ([$queue.items[]?
+                | select((.cancelled // false) != true)
+                | select((.executable.number? // null) == null)
+                | select((.task.url // "") | contains($task_prefix))
+                | (.task.name // "") as $name
+                | select($last | has($name))
+                | {job: $name, inQueueSince: (.inQueueSince // 0)}]
+               | sort_by(.inQueueSince)
+               | group_by(.job)
+               | map(
+                    (.[0].job) as $job
+                    | (if $job == $branch then ([$last[$job], $base] | max) else $last[$job] end) as $b
+                    | to_entries
+                    | map(.value + {number: ($b + .key + 1), timestamp: 0, queued: true}))
+               | add // []
+               | sort_by(.inQueueSince)) as $queued
+            | $running + $queued
+        end
+    ' 2>/dev/null || echo "[]"
 }
 
 # Arguments: job_name, build_number, work_start_ms, estimate_ms, [frame],
@@ -492,7 +568,9 @@ _display_follow_line_progress() {
     fi
 
     if [[ "$include_queue_lines" == "true" ]]; then
-        queued_builds=$(_get_queued_builds_for_progress "$job_name" "$max_running_build")
+        local queue_response
+        queue_response=$(jenkins_api "/queue/api/json" 2>/dev/null) || queue_response=""
+        queued_builds=$(_get_queued_builds_for_progress "$job_name" "$max_running_build" "$queue_response")
         local queued_lines
         queued_lines=$(echo "$queued_builds" | jq -r '.[] | "\(.number)\t\(.inQueueSince)"' 2>/dev/null) || queued_lines=""
         local queued_line queued_num queued_since
@@ -503,6 +581,26 @@ _display_follow_line_progress() {
             queued_line=$(_render_follow_line_queued "$job_name" "$queued_num" "$queued_since" "$estimate_ms" "$frame")
             lines+=("$queued_line")
         done <<< "$queued_lines"
+
+        # Other branches of a multibranch project: the build holding a shared
+        # lock and the builds waiting for it. Estimates reuse the primary
+        # build's, since branches usually share one Jenkinsfile.
+        local sibling_builds sibling_lines
+        sibling_builds=$(_get_sibling_branch_builds_for_progress "$job_name" "$max_running_build" "$queue_response")
+        sibling_lines=$(echo "$sibling_builds" | jq -r '.[] | "\(.job)\t\(.number)\t\(.timestamp)\t\(.queued)\t\(.inQueueSince)"' 2>/dev/null) || sibling_lines=""
+        local sibling_branch sibling_num sibling_ts sibling_queued sibling_since sibling_job
+        while IFS=$'\t' read -r sibling_branch sibling_num sibling_ts sibling_queued sibling_since; do
+            if [[ -z "$sibling_num" ]]; then
+                continue
+            fi
+            sibling_job="${job_name%%/*}/${sibling_branch}"
+            if [[ "$sibling_queued" == "true" ]]; then
+                lines+=("$(_render_follow_line_queued "$sibling_job" "$sibling_num" "$sibling_since" "$estimate_ms" "$frame")")
+            else
+                _resolve_follow_work_start "$sibling_job" "$sibling_num" "$sibling_ts"
+                lines+=("$(_render_follow_line_in_progress "$sibling_job" "$sibling_num" "$_FOLLOW_WORK_START_RESULT" "$estimate_ms" "$frame" "$sibling_ts")")
+            fi
+        done <<< "$sibling_lines"
     fi
 
     _redraw_follow_line_progress_lines "${lines[@]}"

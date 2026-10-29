@@ -157,12 +157,12 @@ _fetch_multibranch_baselines() {
         return 1
     fi
 
-    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number,building]]" 2>/dev/null) || true
+    response=$(jenkins_api "${job_path}/api/json?tree=jobs[name,lastBuild[number,building,timestamp]]" 2>/dev/null) || true
     if [[ -z "$response" ]]; then
         return 1
     fi
 
-    baselines=$(printf '%s\n' "$response" | jq -c '[.jobs[]? | {key: .name, value: {number: (.lastBuild.number // 0), building: (.lastBuild.building // false)}}] | from_entries' 2>/dev/null) || return 1
+    baselines=$(printf '%s\n' "$response" | jq -c '[.jobs[]? | {key: .name, value: {number: (.lastBuild.number // 0), building: (.lastBuild.building // false), timestamp: (.lastBuild.timestamp // 0)}}] | from_entries' 2>/dev/null) || return 1
     if [[ -z "$baselines" || "$baselines" == "null" ]]; then
         return 1
     fi
