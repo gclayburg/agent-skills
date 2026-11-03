@@ -1033,7 +1033,9 @@ Tests run:.*Errors: [1-9]
 [1-9][0-9]* failing
 FAILED.*AssertionError
 AssertionError
-npm ERR! Test failed'
+npm ERR! Test failed
+Tests: +[1-9][0-9]* failed
+Test Suites: +[1-9][0-9]* failed'
 
 # Classify a build failure from its console output and test results.
 #
