@@ -1,6 +1,6 @@
 _parse_build_options() {
     BUILD_NO_FOLLOW=false
-    BAIL_ON_RED=false
+    _init_bail_on_red_option
     BUILD_LINE_MODE=false
     BUILD_PRIOR_JOBS=3
     _LINE_FORMAT_STRING="$_DEFAULT_LINE_FORMAT"
@@ -17,6 +17,12 @@ _parse_build_options() {
                 ;;
             --bail-on-red)
                 BAIL_ON_RED=true
+                BAIL_ON_RED_EXPLICIT=true
+                shift
+                ;;
+            --no-bail-on-red)
+                BAIL_ON_RED=false
+                BAIL_ON_RED_EXPLICIT=false
                 shift
                 ;;
             --line)
@@ -53,14 +59,7 @@ _parse_build_options() {
         esac
     done
 
-    # See the note in cmd_status: line mode uses a separate monitoring loop
-    # with no stage tracking, so --bail-on-red cannot work there.
-    if [[ "$BAIL_ON_RED" == "true" && "$BUILD_LINE_MODE" == "true" ]]; then
-        _usage_error "Cannot combine --bail-on-red with --line"
-    fi
-    if [[ "$BAIL_ON_RED" == "true" && "$BUILD_NO_FOLLOW" == "true" ]]; then
-        _usage_error "Cannot combine --bail-on-red with --no-follow"
-    fi
+    _validate_bail_on_red_option "$BUILD_LINE_MODE" "$BUILD_NO_FOLLOW"
 }
 
 # Monitor triggered build until completion

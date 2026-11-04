@@ -95,7 +95,7 @@ shows anything waiting for a free executor.
 | `scripts/buildgit status --console-text [stage]` | Raw build console or one stage's console text; empty parent stages recurse into descendant substages |
 | `scripts/buildgit status --list-stages [--json]` | List stage names or emit the raw stage array |
 | `scripts/buildgit status -f --once` | Follow current/next build to completion, then exit (10s timeout) |
-| `scripts/buildgit status -f --bail-on-red` | Follow, but stop at the first FAILED stage instead of waiting for the pipeline (exit 3) |
+| `scripts/buildgit status -f --no-bail-on-red` | Follow, waiting for the full Jenkins result even after a stage has FAILED |
 | `scripts/buildgit status -f --once=N` | Same, but wait up to N seconds for a build to start |
 | `scripts/buildgit status -f --probe-all` | Follow the next build that starts on any multibranch branch |
 | `scripts/buildgit status -f --probe-all --once` | Follow one multibranch branch build, then exit |
@@ -105,14 +105,14 @@ shows anything waiting for a free executor.
 | `scripts/buildgit status -n <N> -f --line --once` | Show N prior one-line rows then follow in one-line mode |
 | `scripts/buildgit --threads '[%a] %S %p' status -f --line` | Follow with custom live per-stage row formatting on TTY |
 | `scripts/buildgit status --json` | Machine-readable Jenkins build status |
-| `scripts/buildgit push` | git push + monitor Jenkins build until complete |
-| `scripts/buildgit push --bail-on-red` | git push + stop monitoring at the first FAILED stage (exit 3) |
+| `scripts/buildgit push` | git push + monitor Jenkins build; stops at the first FAILED stage (exit 3) |
+| `scripts/buildgit push --no-bail-on-red` | git push + monitor until Jenkins reports the final result |
 | `scripts/buildgit push --prior-jobs <N>` | git push + preamble with N prior builds + estimate |
 | `scripts/buildgit push --no-follow` | git push only, no build monitoring |
 | `scripts/buildgit push --line` | git push + compact one-line monitoring (TTY shows progress bar) |
 | `scripts/buildgit push --format '<fmt>'` | git push + compact one-line monitoring with custom format |
-| `scripts/buildgit build` | Trigger a new build + monitor until complete |
-| `scripts/buildgit build --bail-on-red` | Trigger + stop monitoring at the first FAILED stage (exit 3) |
+| `scripts/buildgit build` | Trigger a new build + monitor; stops at the first FAILED stage (exit 3) |
+| `scripts/buildgit build --no-bail-on-red` | Trigger + monitor until Jenkins reports the final result |
 | `scripts/buildgit build --prior-jobs <N>` | Trigger + preamble with N prior builds + estimate |
 | `scripts/buildgit build --no-follow` | Trigger only, no monitoring |
 | `scripts/buildgit build --line` | Trigger + compact one-line monitoring (TTY shows progress bar) |
@@ -148,7 +148,7 @@ Threads placeholders are separate from `--format` placeholders:
 `%a`=agent `%S`=stage `%g`=progress-bar `%p`=percent `%e`=elapsed `%E`=estimate `%%`=literal%
 Use width/alignment like `%14a` or `%-14a`. `BUILDGIT_THREADS_FORMAT` sets the default when `--threads` has no explicit format argument.
 Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-loop iteration while using `push`, `build`, or `status -f`.
-`push`, `build`, and `status -f` wait until the build finishes, however long it runs. To cap monitoring, set `MAX_BUILD_TIME` to a number of seconds (e.g. `MAX_BUILD_TIME=3600 scripts/buildgit push`); when the cap is reached buildgit exits 1 with a timeout error, but the Jenkins build keeps running and can be picked up again with `status -f`. `0` (the default) means no limit.
+`push`, `build`, and `status -f` wait until the build finishes or a stage fails (see [Failing fast](#failing-fast-bail-on-red)), however long it runs. To cap monitoring, set `MAX_BUILD_TIME` to a number of seconds (e.g. `MAX_BUILD_TIME=3600 scripts/buildgit push`); when the cap is reached buildgit exits 1 with a timeout error, but the Jenkins build keeps running and can be picked up again with `status -f`. `0` (the default) means no limit.
 
 ## Interpreting Output
 
@@ -159,7 +159,7 @@ Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-
 | 0 | Success (build passed, or git command succeeded) |
 | 1 | Build failed, or an error occurred |
 | 2 | Build is currently in progress |
-| 3 | `--bail-on-red` stopped monitoring: a stage has FAILED and the build cannot pass. The build is still running and was NOT cancelled. |
+| 3 | Bail-on-red (the default) stopped monitoring: a stage has FAILED and the build cannot pass. The build is still running and was NOT cancelled. |
 
 **Build states:**  as reported by Jenkins
 - `SUCCESS` — build passed, all tests green
@@ -199,30 +199,49 @@ For agent-safe follow mode, prefer:
 - `scripts/buildgit status -f --once` to follow exactly one build and exit
 - `scripts/buildgit status -f --probe-all --once` when the next multibranch build may start on a different branch than the current checkout
 
-## Failing fast (`--bail-on-red`)
+## Failing fast (bail-on-red)
 
-By default, monitoring returns only when Jenkins reports the build result. On a
-pipeline with a parallel fan-out, that can be minutes after the outcome was
-actually decided: a measured monorepo build knew it had failed at +232s, when
-one parallel branch went red, but did not report `FAILURE` until +573s because
-a sibling branch ran on for another 5m28s.
+On a pipeline with a parallel fan-out, Jenkins reports the build result
+minutes after the outcome was actually decided. On phandlemono build #424,
+`E2E Tests Shard 2` went `FAILED` at +1132s, but the build did not report
+`FAILURE` until +1486s because a sibling branch ran on for nearly 6 more
+minutes.
 
-`--bail-on-red` stops monitoring within one poll interval of the first stage
-entering `FAILED` and exits **3**. Use it whenever an agent is going to act on
-the failure, so diagnosis can start while the doomed build is still draining.
+So `push`, `build` and `status -f` **stop monitoring within one poll interval
+of the first stage entering `FAILED` and exit 3** by default. No flag is
+needed: diagnosis can start while the doomed build is still draining.
 
 ```bash
-scripts/buildgit push --bail-on-red      # exit 0 green, 3 doomed, 1 error
-scripts/buildgit build --bail-on-red
-scripts/buildgit status -f --bail-on-red
+scripts/buildgit push                     # exit 0 green, 3 doomed, 1 error
+scripts/buildgit push --no-bail-on-red    # wait for the full Jenkins result
+BUILDGIT_BAIL_ON_RED=false scripts/buildgit push   # same, via env default
 ```
 
-The report names the failing stage, prints its console excerpt, and gives the
-infra/code classification described below.
+The bail report names the failing stage, shows any failed tests that stage
+already published, prints its console excerpt and the infra/code
+classification described below, and ends with the command for the full
+report:
+
+```
+Build #424 is still running; other stages may still fail.
+Full report when it finishes: buildgit --job phandlemono/main status 424 --all
+```
+
+**What a bail does not show.** Only the earliest failure is reported. Other
+parallel branches may still fail, and test reports they have not published
+yet are missing. When you need everything, run the full-report command once
+the build finishes, or monitor with `--no-bail-on-red`.
 
 **It stops monitoring, not the build.** buildgit never cancels a Jenkins build
 — other work may depend on it. Expect the build to still be running after a
-bail; treat it as busy when checking for a free executor.
+bail; treat it as busy when checking for a free executor. A fix you push now
+queues behind it unless the pipeline aborts previous builds.
+
+**Opting out.** `--no-bail-on-red` on `push`, `build` or `status`, or
+`BUILDGIT_BAIL_ON_RED=false|0|no|off` in the environment. A flag beats the
+env var, which beats the built-in default (on). When both flags are given,
+the last one wins. `--bail-on-red` is still accepted and restates the
+default.
 
 **Which statuses trigger it.** Only `FAILED`. Deliberately excluded:
 - `ABORTED` — with `failFast` pipelines, the siblings of a failed parallel
@@ -236,16 +255,37 @@ When several stages have failed, the one reported is the **earliest to end**,
 not the first seen. Downstream stages cascade within a second or two of the
 real failure, so array order would routinely name a victim instead of a cause.
 
-**Restrictions.** `--bail-on-red` requires follow mode and is rejected with
-`--line` and `--no-follow`. Line mode runs a separate monitoring loop with no
-per-stage tracking, so the flag cannot work there; it is refused rather than
-silently ignored.
+**Follow modes.** `status -f --once` exits 3 on a bail. Indefinite
+`status -f` prints the bail report and then waits for the next build. With
+`--probe-all` it does not re-attach to the bailed build while that build is
+still running.
+
+**JSON.** `status -f --json --once` prints one JSON object and exits 3 on a
+bail. It is the normal `status --json` output (with `"building": true`) plus
+a top-level `bail` object:
+
+```json
+"bail": {
+  "bailed": true,
+  "failed_stage": "E2E Tests Shard 2",
+  "classification": "code",
+  "error_excerpt": ["..."],
+  "full_report_command": "buildgit --job phandlemono/main status 424 --all"
+}
+```
+
+Builds that finish without a bail have no `bail` key, so test `has("bail")`.
+
+**Line mode never bails.** `--line` / `--format` run a separate monitoring
+loop with no per-stage tracking, so they wait for the final result. An
+explicit `--bail-on-red` combined with `--line` or `--no-follow` is rejected
+rather than silently ignored.
 
 ## Failure classification (infra vs code)
 
 Failed builds are classified so a caller can tell a transient CI fault from a
 real defect. The verdict appears in the human failure summary, in follow-mode
-completion output, in the `--bail-on-red` report, and as a top-level
+completion output, in the bail-on-red report, and as a top-level
 `classification` field in `status --json`.
 
 | Value | Meaning | Right response |

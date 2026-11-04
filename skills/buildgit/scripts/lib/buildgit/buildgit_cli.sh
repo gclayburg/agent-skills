@@ -13,7 +13,7 @@ Global Options:
   --version                      Show version number and exit
 
 Commands:
-  status [build#] [-f|--follow] [--once[=N]] [--probe-all] [-n <count>] [-r|--reverse] [-g|--gitlog[=<range>]] [--json] [--line] [--all] [--no-tests] [--format <fmt>] [--prior-jobs <N>] [--console-text [stage]] [--list-stages]
+  status [build#] [-f|--follow] [--once[=N]] [--probe-all] [-n <count>] [-r|--reverse] [-g|--gitlog[=<range>]] [--json] [--line] [--all] [--no-tests] [--format <fmt>] [--prior-jobs <N>] [--console-text [stage]] [--list-stages] [--no-bail-on-red]
                       Display Jenkins build status (latest or specific build)
                       build# can be absolute (31) or relative (0=latest, -1=previous, -2=two ago)
                       Default: one-line output (TTY adds color), newest build first
@@ -25,10 +25,13 @@ Commands:
                       Show pipeline structure (stages, parallelism, labels)
   queue [--json]
                       Show Jenkins build queue with wait reasons
-  push [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>] [git-push-options] [remote] [branch]
+  push [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>] [--no-bail-on-red] [git-push-options] [remote] [branch]
                       Push commits and monitor Jenkins build
-  build [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>]
+  build [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>] [--no-bail-on-red]
                       Trigger and monitor Jenkins build
+  Monitoring (push, build, status -f) stops at the first FAILED stage and exits 3
+  (bail-on-red); the build keeps running. --no-bail-on-red waits for the full result.
+  --line mode never bails.
   <any-git-command>   Passed through to git
 
 Examples:
@@ -70,6 +73,7 @@ Monitor ongoing Jenkins build jobs:
   buildgit push --prior-jobs 0     # Push + suppress prior-jobs display
   buildgit push --line             # Push + compact one-line monitoring with progress bar
   buildgit --threads push          # Push + show live active-stage progress rows on TTY
+  buildgit push --no-bail-on-red   # Push + wait for the full Jenkins result, even after a stage fails
   buildgit build --line            # Trigger + compact one-line monitoring with progress bar
   buildgit --threads build         # Trigger + show live active-stage progress rows on TTY
   buildgit status -f --prior-jobs 5  # Follow with last 5 builds shown first
@@ -106,6 +110,8 @@ Environment Variables:
   JENKINS_API_TOKEN   Jenkins API token for authentication
   MAX_BUILD_TIME      Max seconds to monitor a running build before giving up
                       (default: 0 = wait until the build finishes)
+  BUILDGIT_BAIL_ON_RED  Default for bail-on-red monitoring (default: true);
+                      false restores waiting for the full result
 EOF
 }
 

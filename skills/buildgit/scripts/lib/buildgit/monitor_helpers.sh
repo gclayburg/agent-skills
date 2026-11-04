@@ -3,25 +3,62 @@
 # a caller can tell "doomed, start diagnosing now" from "finished, failed".
 : "${BUILDGIT_EXIT_BAILED_ON_RED:=3}"
 
-# Report the stage that triggered --bail-on-red and why the build is doomed.
-# Usage: _report_bail_on_red "job" "build#" "stage name"
-#
-# Prints the failing stage plus the shared failure diagnostics, so the caller
-# gets the same console excerpt and infra/code classification it would have
-# received had it waited for the pipeline to finish.
-_report_bail_on_red() {
+# Command that prints the full report for a build once it finishes.
+# Always names the job so it can be pasted from any directory.
+# Spec: bail-on-red-default-spec.md § 5
+_bail_full_report_command() {
+    local job_name="$1"
+    local build_number="$2"
+    echo "buildgit --job ${job_name} status ${build_number} --all"
+}
+
+# Gather the evidence for a bail-on-red report without printing anything.
+# Usage: _collect_bail_on_red_data "job" "build#" "stage name"
+# Sets:
+#   _BAIL_EVIDENCE_CONSOLE  console text the error excerpt comes from
+#   _BAIL_CLASSIFICATION    infra | code | unknown
+#   _BAIL_TEST_RESULTS      collected test results JSON array (may be empty)
+#   _BAIL_TEST_RESULTS_RC   0 ok, 2 Jenkins communication failure
+#   _BAIL_FAILED_TESTS      failed test count, or "unknown"
+# Shared by the human report and the JSON bail object so both agree.
+_collect_bail_on_red_data() {
     local job_name="$1"
     local build_number="$2"
     local failed_stage="$3"
 
-    echo ""
-    bg_log_error "Stage '${failed_stage}' FAILED - build #${build_number} cannot pass"
-    # ESSENTIAL, not INFO: the caller acts on these two lines, and bg_log_info
-    # is suppressed unless -v was passed.
-    bg_log_essential "Stopped monitoring early (--bail-on-red). The build is still running and was NOT cancelled."
+    _BAIL_EVIDENCE_CONSOLE=""
+    _BAIL_CLASSIFICATION="unknown"
+    _BAIL_TEST_RESULTS=""
+    _BAIL_TEST_RESULTS_RC=0
+    _BAIL_FAILED_TESTS="unknown"
 
     local stage_console=""
     stage_console=$(get_stage_console_output "$job_name" "$build_number" "$failed_stage" 2>/dev/null) || stage_console=""
+
+    # Pipelines often record JUnit results inside the failing branch before
+    # that branch closes, so a test report may already exist at bail time.
+    # Downstream detection reads the stage console: a downstream build that
+    # this stage triggered is announced there.
+    # Spec: bail-on-red-default-spec.md § 6
+    local collected="" collected_rc=0
+    if collected=$(collect_downstream_test_results "$job_name" "$build_number" "$stage_console" 2>/dev/null); then
+        collected_rc=0
+    else
+        collected_rc=$?
+        collected=""
+    fi
+    _BAIL_TEST_RESULTS_RC="$collected_rc"
+    if [[ "$collected_rc" -eq 0 && -n "$collected" ]]; then
+        local has_report
+        has_report=$(printf '%s\n' "$collected" | jq -r '[.[] | select((.test_json // "") != "")] | length' 2>/dev/null) || has_report=0
+        if [[ "$has_report" =~ ^[0-9]+$ && "$has_report" -gt 0 ]]; then
+            _BAIL_TEST_RESULTS="$collected"
+            local totals
+            totals=$(aggregate_test_totals "$collected" 2>/dev/null) || totals=""
+            _BAIL_FAILED_TESTS=$(printf '%s\n' "$totals" | sed -n '3p')
+            [[ "$_BAIL_FAILED_TESTS" =~ ^[0-9]+$ ]] || _BAIL_FAILED_TESTS="unknown"
+        fi
+    fi
 
     # A stage that contains substages returns only its FIRST substage's log
     # here, which for a Jenkins docker-agent failure is the git checkout --
@@ -36,13 +73,13 @@ _report_bail_on_red() {
     # useless: the caller neither retries nor gets a real diagnosis.
     local evidence_console="$stage_console"
     local classification=""
-    classification=$(classify_build_failure "$stage_console" "unknown")
+    classification=$(classify_build_failure "$stage_console" "$_BAIL_FAILED_TESTS")
     if [[ "$classification" == "unknown" ]]; then
         local full_console=""
         full_console=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || full_console=""
         if [[ -n "$full_console" ]]; then
             local full_classification
-            full_classification=$(classify_build_failure "$full_console" "unknown")
+            full_classification=$(classify_build_failure "$full_console" "$_BAIL_FAILED_TESTS")
             if [[ "$full_classification" != "unknown" ]]; then
                 evidence_console="$full_console"
                 classification="$full_classification"
@@ -52,20 +89,105 @@ _report_bail_on_red() {
         fi
     fi
 
-    if [[ -n "$evidence_console" ]]; then
+    _BAIL_EVIDENCE_CONSOLE="$evidence_console"
+    _BAIL_CLASSIFICATION="$classification"
+}
+
+# First FAILED stage of a running build, for the JSON follow path, which has
+# no stage tracker. Uses the same wfapi stage data and selection rules as
+# the full monitor loop. Echoes the stage name or nothing.
+# Spec: bail-on-red-default-spec.md § 7
+_json_follow_first_failed_stage() {
+    local job_name="$1"
+    local build_number="$2"
+
+    local stages
+    stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || stages="[]"
+    [[ -z "${stages//[$' \t\r\n']}" ]] && stages="[]"
+    _find_first_failed_stage "{\"parent\": ${stages}, \"nested\": []}"
+}
+
+# Print the JSON bail-on-red result: the normal status JSON for the build
+# plus a top-level "bail" object. Human-readable text never goes to stdout.
+# Spec: bail-on-red-default-spec.md § 7
+_emit_json_bail_on_red() {
+    local job_name="$1"
+    local build_number="$2"
+    local failed_stage="$3"
+
+    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage"
+
+    local status_json=""
+    status_json=$(_jenkins_status_check "$job_name" "true" "$build_number" 2>/dev/null) || true
+    if ! printf '%s\n' "$status_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        status_json="{}"
+    fi
+
+    local excerpt=""
+    if [[ -n "$_BAIL_EVIDENCE_CONSOLE" ]]; then
+        excerpt=$(NO_COLOR=1 extract_error_lines "$_BAIL_EVIDENCE_CONSOLE" 30 2>/dev/null) || excerpt=""
+    fi
+
+    printf '%s\n' "$status_json" | jq \
+        --arg stage "$failed_stage" \
+        --arg classification "$_BAIL_CLASSIFICATION" \
+        --arg excerpt "$excerpt" \
+        --arg cmd "$(_bail_full_report_command "$job_name" "$build_number")" \
+        '. + {bail: {
+            bailed: true,
+            failed_stage: $stage,
+            classification: $classification,
+            error_excerpt: ($excerpt | split("\n") | map(select(length > 0))),
+            full_report_command: $cmd
+        }}'
+}
+
+# Report the stage that triggered bail-on-red and why the build is doomed.
+# Usage: _report_bail_on_red "job" "build#" "stage name"
+#
+# Prints the failing stage, any already-published failed tests, the console
+# excerpt and infra/code classification, then how to get the full report.
+# Spec: bail-on-red-default-spec.md § 5, § 6
+_report_bail_on_red() {
+    local job_name="$1"
+    local build_number="$2"
+    local failed_stage="$3"
+
+    echo ""
+    bg_log_error "Stage '${failed_stage}' FAILED - build #${build_number} cannot pass"
+    # ESSENTIAL, not INFO: the caller acts on these two lines, and bg_log_info
+    # is suppressed unless -v was passed.
+    bg_log_essential "Stopped monitoring early (bail-on-red). The build is still running and was NOT cancelled."
+
+    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage"
+
+    # Failed tests that the stage already published. Nothing is printed when
+    # no report exists yet or it has no failures: the hint below covers it.
+    if [[ "$_BAIL_TEST_RESULTS_RC" -eq 2 ]]; then
+        _note_test_results_comm_failure "$job_name" "$build_number"
+        display_test_results_comm_error
+    elif [[ "$_BAIL_FAILED_TESTS" =~ ^[0-9]+$ && "$_BAIL_FAILED_TESTS" -gt 0 ]]; then
+        echo ""
+        display_hierarchical_test_results "$_BAIL_TEST_RESULTS"
+    fi
+
+    if [[ -n "$_BAIL_EVIDENCE_CONSOLE" ]]; then
         echo ""
         echo "${COLOR_YELLOW}=== Stage '${failed_stage}' Errors ===${COLOR_RESET}"
-        extract_error_lines "$evidence_console" 30
+        extract_error_lines "$_BAIL_EVIDENCE_CONSOLE" 30
         echo "${COLOR_YELLOW}=================================${COLOR_RESET}"
     fi
     echo ""
-    echo "${COLOR_YELLOW}$(format_failure_classification "$classification")${COLOR_RESET}"
+    echo "${COLOR_YELLOW}$(format_failure_classification "$_BAIL_CLASSIFICATION")${COLOR_RESET}"
 
     local console_url
     console_url=$(jenkins_console_url "$job_name" "$build_number" 2>/dev/null) || console_url=""
     if [[ -n "$console_url" ]]; then
         bg_log_essential "Full console: ${console_url}"
     fi
+
+    bg_log_essential "Build #${build_number} is still running; other stages may still fail."
+    bg_log_essential "Full report when it finishes: $(_bail_full_report_command "$job_name" "$build_number")"
 }
 
 # Monitor a build until completion
@@ -955,12 +1077,48 @@ _branch_was_in_progress() {
     return 1
 }
 
+# Record a build that bailed on red, for probe-all skipping.
+# Usage: _record_bailed_build <bailed_json> <branch> <build_number>
+# Echoes the updated { "branch": build# } map.
+# Spec: bail-on-red-default-spec.md § 4
+_record_bailed_build() {
+    local bailed_json="${1:-}"
+    local branch="$2"
+    local build_number="$3"
+
+    [[ -z "${bailed_json//[$' \t\r\n']}" ]] && bailed_json="{}"
+    if [[ -z "$branch" || ! "$build_number" =~ ^[0-9]+$ ]]; then
+        echo "$bailed_json"
+        return 0
+    fi
+    printf '%s\n' "$bailed_json" | jq -c --arg b "$branch" --argjson n "$build_number" '.[$b] = $n' 2>/dev/null || echo "$bailed_json"
+}
+
+# Raise probe-all baselines so builds that already bailed on red are never
+# detected again while they keep running.
+# Usage: _apply_bailed_build_baselines <flat_baselines_json> <bailed_json>
+_apply_bailed_build_baselines() {
+    local baselines="$1"
+    local bailed_json="${2:-}"
+
+    if [[ -z "${bailed_json//[$' \t\r\n']}" || "$bailed_json" == "{}" || -z "${baselines//[$' \t\r\n']}" ]]; then
+        echo "$baselines"
+        return 0
+    fi
+    printf '%s\n' "$baselines" | jq -c --argjson s "$bailed_json" '
+        reduce ($s | to_entries[]) as $e (.; .[$e.key] = ([(.[$e.key] // 0), $e.value] | max))
+    ' 2>/dev/null || echo "$baselines"
+}
+
 # Wait for a new multibranch build to start on any branch.
-# Arguments: top_job_name
+# Arguments: top_job_name [bailed_builds_json]
+#   bailed_builds_json: { "branch": build# } of builds that already bailed on
+#   red; those builds are skipped even though they are still running.
 # Prints "branch build_number" on stdout and returns 0 on success.
-# Spec: 2026-04-10_probe-all-initial-build-spec.md
+# Spec: 2026-04-10_probe-all-initial-build-spec.md, bail-on-red-default-spec.md § 4
 _follow_wait_probe_all() {
     local top_job_name="$1"
+    local bailed_builds_json="${2:-}"
     local raw_baselines in_progress_branches baselines fetch_failures=0
 
     # Keep retrying the baseline fetch: an empty/failed response must never be
@@ -974,6 +1132,7 @@ _follow_wait_probe_all() {
     fetch_failures=0
     in_progress_branches=$(echo "$raw_baselines" | jq -r '[to_entries[] | select(.value.building == true) | .key] | join(" ")')
     baselines=$(_normalize_probe_all_baselines "$raw_baselines")
+    baselines=$(_apply_bailed_build_baselines "$baselines" "$bailed_builds_json")
 
     log_info "Waiting for Jenkins build ${top_job_name} (any branch) to start..."
 

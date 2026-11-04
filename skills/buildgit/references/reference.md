@@ -148,6 +148,37 @@ Finished: FAILURE
 [09:13:48] ℹ Duration: 0s
 ```
 
+## Bail-on-red report (default for push, build, status -f)
+
+Monitoring stops at the first stage that enters `FAILED` and exits 3, without waiting for the rest of the pipeline. The build keeps running. Use `--no-bail-on-red` (or `BUILDGIT_BAIL_ON_RED=false`) to wait for the full result, which prints the completion output shown above. `--line` mode never bails.
+
+The report lists, in order: the failed stage, a failed-test table (only if the stage has already published test results that include failures), the stage's error excerpt, the infra/code classification, the console URL, and the command for the full report:
+
+```text
+[11:15:19] ✗ Stage 'E2E Tests Shard 2' FAILED - build #424 cannot pass
+Stopped monitoring early (bail-on-red). The build is still running and was NOT cancelled.
+
+=== Test Results ===
+  Total: 9 | Passed: 8 | Failed: 1 | Skipped: 0
+
+  FAILED TESTS:
+  ✗ e2e/consumer-domain-delete.e2e.test.ts::PH0204 deletion scenario: startup
+    Error: expect(locator).toBeHidden() failed
+====================
+
+=== Stage 'E2E Tests Shard 2' Errors ===
+  1) e2e/consumer-domain-delete.e2e.test.ts:848:9 › PH0204 consumer domain deletion › PH0204 deletion scenario: startup
+  1 failed
+=================================
+
+Classification: code - source or test defect, fix before retrying
+Full console: https://jenkins.example.com/job/phandlemono/job/main/424/console
+Build #424 is still running; other stages may still fail.
+Full report when it finishes: buildgit --job phandlemono/main status 424 --all
+```
+
+`status -f --json --once` prints one JSON object instead: the normal `status --json` output for the running build plus a top-level `bail` object (`bailed`, `failed_stage`, `classification`, `error_excerpt`, `full_report_command`). Builds that finish without a bail have no `bail` key.
+
 ## Hierarchical downstream test results
 
 For multi-component pipelines, full output now keeps the parent job row and adds one row per downstream build (with the Jenkins job name and build number), then reports aggregate totals:

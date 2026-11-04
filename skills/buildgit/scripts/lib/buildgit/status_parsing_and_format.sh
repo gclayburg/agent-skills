@@ -21,6 +21,7 @@ _parse_status_options() {
     STATUS_REVERSE=false
     STATUS_GITLOG=false
     STATUS_GITLOG_RANGE=""
+    _init_bail_on_red_option
     _LINE_FORMAT_STRING="$_DEFAULT_LINE_FORMAT"
 
     while [[ $# -gt 0 ]]; do
@@ -39,6 +40,12 @@ _parse_status_options() {
                 ;;
             --bail-on-red)
                 BAIL_ON_RED=true
+                BAIL_ON_RED_EXPLICIT=true
+                shift
+                ;;
+            --no-bail-on-red)
+                BAIL_ON_RED=false
+                BAIL_ON_RED_EXPLICIT=false
                 shift
                 ;;
             --probe-all)

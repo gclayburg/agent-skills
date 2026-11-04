@@ -24,7 +24,9 @@ _cmd_status_follow() {
     # Set up interrupt handler for follow mode
     trap _follow_mode_cleanup SIGINT SIGTERM
 
-    if [[ "$line_mode" != "true" ]]; then
+    # JSON mode keeps stdout to the single JSON result.
+    # Spec: bail-on-red-default-spec.md § 7
+    if [[ "$line_mode" != "true" && "$json_mode" != "true" ]]; then
         if [[ "$once_mode" == "true" ]]; then
             if [[ "$probe_all" == "true" ]]; then
                 log_info "Follow mode enabled (once, timeout=${once_timeout}s) - monitoring builds for job '$job_name' across all branches"
@@ -46,6 +48,9 @@ _cmd_status_follow() {
     local first_check=true
     local preamble_printed=false
     local starting_notified=false
+    # Builds that bailed on red while still running: { "branch": build# }.
+    # Probe-all must not re-attach to them. Spec: bail-on-red-default-spec.md § 4
+    local bailed_builds_json="{}"
 
     while true; do
         if [[ "$probe_all" == "true" && "$job_name" == "$top_job_name" ]]; then
@@ -68,7 +73,7 @@ _cmd_status_follow() {
                 if [[ "$line_mode" != "true" ]]; then
                     bg_log_essential "Waiting for first build of $top_job_name..."
                 fi
-                probe_output=$(_follow_wait_probe_all "$top_job_name")
+                probe_output=$(_follow_wait_probe_all "$top_job_name" "$bailed_builds_json")
             fi
 
             printf '%s\n' "$probe_output"
@@ -161,6 +166,17 @@ _cmd_status_follow() {
                         break
                     fi
 
+                    # Bail-on-red in JSON mode: one JSON object, exit 3.
+                    # Spec: bail-on-red-default-spec.md § 7
+                    if [[ "${BAIL_ON_RED:-false}" == "true" ]]; then
+                        local json_failed_stage
+                        json_failed_stage=$(_json_follow_first_failed_stage "$job_name" "$build_number")
+                        if [[ -n "$json_failed_stage" ]]; then
+                            _emit_json_bail_on_red "$job_name" "$build_number" "$json_failed_stage"
+                            return "$BUILDGIT_EXIT_BAILED_ON_RED"
+                        fi
+                    fi
+
                     sleep "$POLL_INTERVAL"
                     elapsed=$((elapsed + POLL_INTERVAL))
                 done
@@ -195,15 +211,24 @@ _cmd_status_follow() {
                 _display_build_in_progress_banner "$job_name" "$build_number" "$running_msg"
                 local follow_monitor_rc=0
                 _monitor_build "$job_name" "$build_number" "true" "true" || follow_monitor_rc=$?
-                # --bail-on-red stopped at a red stage while the build is
+                # Bail-on-red stopped at a red stage while the build is
                 # still running. There is no completion to handle, and the
-                # bail report is already printed, so return the code now.
+                # bail report is already printed. --once returns the code
+                # now; indefinite follow carries on to the next build.
+                # Spec: bail-on-red-default-spec.md § 4
                 if [[ "$follow_monitor_rc" -eq "$BUILDGIT_EXIT_BAILED_ON_RED" ]]; then
-                    return "$follow_monitor_rc"
-                fi
-                # Display build completion (test results if applicable + Finished line)
-                # Spec: unify-follow-log-spec.md, Section 4 (Build Completion)
-                if _handle_build_completion "$job_name" "$build_number"; then
+                    if [[ "$once_mode" == "true" ]]; then
+                        return "$follow_monitor_rc"
+                    fi
+                    build_exit_code="$follow_monitor_rc"
+                    if [[ "$probe_all" == "true" ]]; then
+                        # The bailed build is still running, so probe-all
+                        # would see it as "in progress" and attach again.
+                        bailed_builds_json=$(_record_bailed_build "$bailed_builds_json" "${job_name#"${top_job_name}"/}" "$build_number")
+                    fi
+                elif _handle_build_completion "$job_name" "$build_number"; then
+                    # Display build completion (test results if applicable + Finished line)
+                    # Spec: unify-follow-log-spec.md, Section 4 (Build Completion)
                     build_exit_code=0
                 else
                     build_exit_code=$?

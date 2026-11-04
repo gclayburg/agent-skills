@@ -359,12 +359,70 @@ cmd_status() {
 # Push Command Implementation
 # =============================================================================
 
+# Initialise the bail-on-red option state at the start of a command parser.
+# Spec: bail-on-red-default-spec.md § 3
+#
+# Sets:
+#   BAIL_ON_RED          effective value, from BUILDGIT_BAIL_ON_RED, default on
+#   BAIL_ON_RED_EXPLICIT true only while --bail-on-red is the last bail flag
+#
+# Only an explicit --bail-on-red is validated against --line, --no-follow and
+# a missing -f. The built-in default and the env var never cause a usage
+# error. An unrecognised env value warns once on stderr and leaves bail on.
+_init_bail_on_red_option() {
+    local raw="${BUILDGIT_BAIL_ON_RED:-}"
+    local value
+    # Lowercase with tr: bash 3.2 has no case-conversion expansion
+    value=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        ""|true|1|yes|on)
+            BAIL_ON_RED=true
+            ;;
+        false|0|no|off)
+            BAIL_ON_RED=false
+            ;;
+        *)
+            if [[ "${_BAIL_ON_RED_ENV_WARNED:-false}" != "true" ]]; then
+                echo "[WARNING] Ignoring invalid BUILDGIT_BAIL_ON_RED value '${raw}' (expected true/false); bail-on-red stays on" >&2
+                _BAIL_ON_RED_ENV_WARNED=true
+            fi
+            BAIL_ON_RED=true
+            ;;
+    esac
+    BAIL_ON_RED_EXPLICIT=false
+}
+
+# Validate the bail-on-red flags once a parser has read all options.
+# Usage: _validate_bail_on_red_option <line_mode> <no_follow> [<follow_required_missing>]
+# Line mode and --no-follow have no per-stage tracking, so bail cannot apply:
+# an explicit --bail-on-red is rejected, the default silently turns off.
+_validate_bail_on_red_option() {
+    local line_mode="${1:-false}"
+    local no_follow="${2:-false}"
+    local follow_missing="${3:-false}"
+
+    if [[ "${BAIL_ON_RED_EXPLICIT:-false}" == "true" ]]; then
+        if [[ "$line_mode" == "true" ]]; then
+            _usage_error "Cannot combine --bail-on-red with --line"
+        fi
+        if [[ "$no_follow" == "true" ]]; then
+            _usage_error "Cannot combine --bail-on-red with --no-follow"
+        fi
+        if [[ "$follow_missing" == "true" ]]; then
+            _usage_error "--bail-on-red requires -f/--follow"
+        fi
+    fi
+    if [[ "$line_mode" == "true" || "$no_follow" == "true" || "$follow_missing" == "true" ]]; then
+        BAIL_ON_RED=false
+    fi
+}
+
 # Parse push command options
 # Separates buildgit options (--no-follow) from git push options
 # Sets: PUSH_NO_FOLLOW, PUSH_GIT_ARGS
 _parse_push_options() {
     PUSH_NO_FOLLOW=false
-    BAIL_ON_RED=false
+    _init_bail_on_red_option
     PUSH_LINE_MODE=false
     PUSH_PRIOR_JOBS=3
     PUSH_GIT_ARGS=()
@@ -374,6 +432,12 @@ _parse_push_options() {
         case "$1" in
             --bail-on-red)
                 BAIL_ON_RED=true
+                BAIL_ON_RED_EXPLICIT=true
+                shift
+                ;;
+            --no-bail-on-red)
+                BAIL_ON_RED=false
+                BAIL_ON_RED_EXPLICIT=false
                 shift
                 ;;
             --no-follow)
@@ -414,6 +478,9 @@ _parse_push_options() {
                 ;;
         esac
     done
+
+    # Spec: bail-on-red-default-spec.md § 2, § 3
+    _validate_bail_on_red_option "$PUSH_LINE_MODE" "$PUSH_NO_FOLLOW"
 }
 
 # Wait for a new build to start
