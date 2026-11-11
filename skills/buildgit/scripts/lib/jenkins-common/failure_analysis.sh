@@ -70,7 +70,7 @@ detect_all_downstream_builds() {
             else
                 completed_line="${completed_job} ${completed_build}"
             fi
-            if ! echo "$combined_lines" | grep -Fqx "$completed_line" 2>/dev/null; then
+            if ! grep -Fqx "$completed_line" <<<"$combined_lines" 2>/dev/null; then
                 if [[ -n "$combined_lines" ]]; then
                     combined_lines="${combined_lines}
 ${completed_line}"
@@ -805,15 +805,15 @@ detect_trigger_type() {
 
     if [[ -z "$started_by_line" ]]; then
         # Check for other trigger patterns
-        if echo "$console_output" | grep -q "^Started by an SCM change" 2>/dev/null; then
+        if grep -q "^Started by an SCM change" <<<"$console_output" 2>/dev/null; then
             echo "scm"
             echo "unknown"
             return 0
-        elif echo "$console_output" | grep -q "^Started by timer" 2>/dev/null; then
+        elif grep -q "^Started by timer" <<<"$console_output" 2>/dev/null; then
             echo "timer"
             echo "unknown"
             return 0
-        elif echo "$console_output" | grep -q "^Started by upstream project" 2>/dev/null; then
+        elif grep -q "^Started by upstream project" <<<"$console_output" 2>/dev/null; then
             echo "upstream"
             echo "unknown"
             return 0

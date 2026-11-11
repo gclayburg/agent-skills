@@ -21,9 +21,22 @@ _status_special_output() {
     fi
 
     if [[ -n "${STATUS_CONSOLE_TEXT_STAGE:-}" ]]; then
+        # A full stage path from a bail report ("A->B->C") may name a stage
+        # of a downstream job; read it from that job.
+        # Spec: bail-report-downstream-spec.md § 5
+        local console_job="$job_name" console_build="$build_number" console_stage="$STATUS_CONSOLE_TEXT_STAGE"
+        if [[ "$console_stage" == *"->"* ]]; then
+            resolve_stage_path_target "$job_name" "$build_number" "$console_stage"
+            if [[ "$_STAGE_TARGET_DOWNSTREAM" == "true" ]]; then
+                console_job="$_STAGE_TARGET_JOB"
+                console_build="$_STAGE_TARGET_BUILD"
+                console_stage="$_STAGE_TARGET_STAGE"
+                bg_log_info "Stage '${STATUS_CONSOLE_TEXT_STAGE}' runs in ${console_job} #${console_build} as '${console_stage}'"
+            fi
+        fi
         local stage_tmp
         stage_tmp=$(mktemp)
-        if get_stage_console_output "$job_name" "$build_number" "$STATUS_CONSOLE_TEXT_STAGE" >"$stage_tmp"; then
+        if get_stage_console_output "$console_job" "$console_build" "$console_stage" >"$stage_tmp"; then
             cat "$stage_tmp"
             rm -f "$stage_tmp"
             return 0
@@ -31,17 +44,17 @@ _status_special_output() {
             local stage_rc=$?
             rm -f "$stage_tmp"
             if [[ "$stage_rc" -eq 3 ]]; then
-                bg_log_error "Stage '${STATUS_CONSOLE_TEXT_STAGE}' not found for build #${build_number}"
+                bg_log_error "Stage '${console_stage}' not found for ${console_job} build #${console_build}"
                 if [[ -n "${_STAGE_CONSOLE_AVAILABLE_STAGES:-}" ]]; then
                     printf 'Available stages:\n%s\n' "$_STAGE_CONSOLE_AVAILABLE_STAGES" >&2
                 fi
             elif [[ "$stage_rc" -eq 4 ]]; then
-                bg_log_error "Stage '${STATUS_CONSOLE_TEXT_STAGE}' is ambiguous for build #${build_number}"
+                bg_log_error "Stage '${console_stage}' is ambiguous for ${console_job} build #${console_build}"
                 if [[ -n "${_STAGE_CONSOLE_AMBIGUOUS_STAGES:-}" ]]; then
                     printf 'Matching stages:\n%s\n' "$_STAGE_CONSOLE_AMBIGUOUS_STAGES" >&2
                 fi
             else
-                bg_log_error "Could not retrieve console text for stage '${STATUS_CONSOLE_TEXT_STAGE}' in build #${build_number}"
+                bg_log_error "Could not retrieve console text for stage '${console_stage}' in ${console_job} build #${console_build}"
             fi
             return 1
         fi

@@ -54,6 +54,7 @@ Invoke commands from the skill directory, or use the full path to `scripts/build
 | Commit is pushed, trigger a new build and watch it | `scripts/buildgit build` |
 | Push unpushed commits and watch the resulting build | `scripts/buildgit push` |
 | Watch a build that is already running or about to start | `scripts/buildgit status -f --once=60` |
+| Wait for a running build to finish (e.g. after a bail), then push | `scripts/buildgit wait --queue` |
 | Check what the last build did (already finished) | `scripts/buildgit status` |
 | Trigger a build without monitoring | `scripts/buildgit build --no-follow` |
 | Find out whether *any* build is running, on any branch or job | `scripts/buildgit agents --nodes` |
@@ -133,6 +134,10 @@ shows anything waiting for a free executor.
 | `scripts/buildgit pipeline --json` | Emit pipeline graph, stage types, agent labels, and per-stage `testSuites` as JSON |
 | `scripts/buildgit queue` | Show the current Jenkins queue and wait reasons |
 | `scripts/buildgit queue --json` | Emit queued items, wait reasons, and queue duration as JSON |
+| `scripts/buildgit wait [build#]` | Block until the build (default: latest) finishes, then print its `--line` row; never bails, never waits for a new build |
+| `scripts/buildgit wait --queue` | Same, then also wait until nothing for this job/branch is queued (the branch is idle; safe to push) |
+| `scripts/buildgit wait --timeout <s>` | Give up after `<s>` seconds (exit 2, still running) |
+| `scripts/buildgit wait --json` | Print the finished build's `status --json` object instead of a row |
 | `scripts/buildgit --console auto status` | Show default console log on failure |
 | `scripts/buildgit --console <N> status` | Show last N raw console lines on failure |
 | `scripts/buildgit --job <name|name/branch> <cmd>` | Override auto-detected job name (supports multibranch) |
@@ -158,8 +163,9 @@ Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-
 |------|---------|
 | 0 | Success (build passed, or git command succeeded) |
 | 1 | Build failed, or an error occurred |
-| 2 | Build is currently in progress |
+| 2 | Build is currently in progress (snapshot `status` on a running build, or `wait --timeout` expired) |
 | 3 | Bail-on-red (the default) stopped monitoring: a stage has FAILED and the build cannot pass. The build is still running and was NOT cancelled. |
+| 4 | Nothing to follow: `status -f --once[=N]` saw no new build start within its timeout, or `wait` found no build to wait for |
 
 **Build states:**  as reported by Jenkins
 - `SUCCESS` — build passed, all tests green
@@ -174,7 +180,7 @@ Set `BUILDGIT_DEBUG_TIMING=1` to add stderr timing diagnostics for each monitor-
 
 For failures, summarize the failed stage name, error logs, and test failure details for the user.
 When a failure needs more detail, prefer `scripts/buildgit -v status --json` for structured failed-test stdout and `scripts/buildgit status --console-text <stage>` after `scripts/buildgit status --list-stages`.
-`--console-text <stage>` accepts exact, case-insensitive, and unique partial stage matches. If the requested parent stage has no direct log text, it walks descendant substages and emits their logs in pipeline order.
+`--console-text <stage>` accepts exact, case-insensitive, and unique partial stage matches. If the requested parent stage has no direct log text, it walks descendant substages and emits their logs in pipeline order. A full stage path as printed by a bail report or `status --json` (`Build Handle->Linux Build & Package->Test`) also works on the root job: when the path belongs to a downstream job, buildgit reads that job's stage (`Test` in `phandlemono-handle/<branch>`).
 Normal build/status output goes to stdout, including queue updates, stage progress, completion summaries, and verbose diagnostics. stderr is reserved for invalid input, Jenkins communication failures, and transient TTY redraw sequences.
 With `BUILDGIT_DEBUG_TIMING=1`, monitoring commands also emit `[buildgit-timing] iter=<N> build_info=<ms> stage_track=<ms> total=<ms> building=<bool>` to stderr; the values use second-precision timestamps scaled to milliseconds for bash 3.2 portability. After completion they emit `[buildgit-settle] iterations=<n> elapsed=<s> stable_polls=<n> tracking_complete=<bool> verified_exit=<bool> flushes=<n>` summarizing the post-completion settle phase (`verified_exit=true` = early exit because a completion flush agreed with an independent tracker sample).
 Full header output is condensed: `Trigger:` merges cause plus user (`Manual by …`, `SCM change`, `Timer`, `Upstream`), `Commit:` includes the subject line when available, and `Agent:` is a top-level field instead of a boxed Build Info section.
@@ -219,13 +225,22 @@ BUILDGIT_BAIL_ON_RED=false scripts/buildgit push   # same, via env default
 
 The bail report names the failing stage, shows any failed tests that stage
 already published, prints its console excerpt and the infra/code
-classification described below, and ends with the command for the full
-report:
+classification described below, and ends with ready-to-run follow-ups:
 
 ```
 Build #424 is still running; other stages may still fail.
+Stage log:      buildgit --job phandlemono/main status 424 --console-text 'E2E Tests Shard 2'
+Failed tests:   buildgit --job phandlemono/main status 424 --json
 Full report when it finishes: buildgit --job phandlemono/main status 424 --all
 ```
+
+**Stages of downstream jobs.** When the failed stage runs in a downstream
+job (a path like `Build Handle->Linux Build & Package->Test`), the report
+adds `Failing job: phandlemono-handle/<branch> #7, stage 'Test'`, and the
+excerpt, failed tests and classification come from that child build, not
+from the root build's interleaved console. If the child has published no
+failed tests yet, the report says so. The `Stage log` command names the
+child job and its own stage name, so it can be pasted as-is.
 
 **What a bail does not show.** Only the earliest failure is reported. Other
 parallel branches may still fail, and test reports they have not published
@@ -255,6 +270,26 @@ When several stages have failed, the one reported is the **earliest to end**,
 not the first seen. Downstream stages cascade within a second or two of the
 real failure, so array order would routinely name a victim instead of a cause.
 
+**After a bail: wait, fix, push.** The doomed build keeps running, and a fix
+should be pushed the moment it ends. Start the wait in the background right
+away, diagnose and fix while it runs, and push when both are done:
+
+```bash
+scripts/buildgit wait --queue      # background; returns within one poll of the build ending
+```
+
+`wait` never bails and never waits for a new build, so it is the right tool
+here. (For the same reason, `wait` run right after `push --no-follow` may
+report the previous build if Jenkins has not started the new one yet; let
+`push` monitor its own build.) Do not build this wait out of `status -f --once`:
+- without `--no-bail-on-red`, `status -f --once` returns exit 3 within seconds
+  on a build that already has a FAILED stage, so a loop around it busy-polls;
+- `--once=N` on a build that has already finished waits N seconds for a *new*
+  build (and then exits 4), so a large N adds that much delay after every build.
+
+To read the failures once the build is done, one `scripts/buildgit status <N> --json`
+gives `failure.root_cause_job` and `test_results.failed_tests`.
+
 **Follow modes.** `status -f --once` exits 3 on a bail. Indefinite
 `status -f` prints the bail report and then waits for the next build. With
 `--probe-all` it does not re-attach to the bailed build while that build is
@@ -267,12 +302,22 @@ a top-level `bail` object:
 ```json
 "bail": {
   "bailed": true,
-  "failed_stage": "E2E Tests Shard 2",
+  "failed_stage": "Build Handle->Linux Build & Package->Test",
+  "failed_job": "phandlemono-handle/main",
+  "failed_build": 7,
+  "failed_job_stage": "Test",
   "classification": "code",
   "error_excerpt": ["..."],
+  "console_text_command": "buildgit --job phandlemono-handle/main status 7 --console-text 'Test'",
+  "json_report_command": "buildgit --job phandlemono/main status 424 --json",
   "full_report_command": "buildgit --job phandlemono/main status 424 --all"
 }
 ```
+
+For a stage of the root job, `failed_job` / `failed_build` are the root job
+and build and `failed_job_stage` equals `failed_stage`. The JSON path sees
+only root stages while it polls; when a root stage that triggered a
+downstream job fails, it reports the deepest failed stage inside it.
 
 Builds that finish without a bail have no `bail` key, so test `has("bail")`.
 

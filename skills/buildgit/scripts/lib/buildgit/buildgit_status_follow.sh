@@ -63,11 +63,11 @@ _cmd_status_follow() {
             if [[ "$once_mode" == "true" ]]; then
                 if [[ "$once_timeout" == "0" ]]; then
                     bg_log_error "no new build detected for 0 seconds"
-                    return 2
+                    return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                 fi
                 if ! probe_output=$(_follow_wait_probe_all_timeout "$top_job_name" "$once_timeout"); then
                     bg_log_error "no new build detected for ${once_timeout} seconds"
-                    return 2
+                    return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                 fi
             else
                 if [[ "$line_mode" != "true" ]]; then
@@ -98,11 +98,11 @@ _cmd_status_follow() {
             if [[ "$first_check" == "true" && "$once_mode" == "true" ]]; then
                 if [[ "$once_timeout" == "0" ]]; then
                     bg_log_error "no new build detected for 0 seconds"
-                    return 2
+                    return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                 fi
                 if ! _follow_wait_for_new_build_timeout "$job_name" "0" "$once_timeout" > /dev/null; then
                     bg_log_error "no new build detected for ${once_timeout} seconds"
-                    return 2
+                    return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                 fi
                 first_check=false
                 continue
@@ -246,11 +246,11 @@ _cmd_status_follow() {
                 if [[ "$once_mode" == "true" ]]; then
                     if [[ "$once_timeout" == "0" ]]; then
                         bg_log_error "no new build detected for 0 seconds"
-                        return 2
+                        return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                     fi
                     if ! _follow_wait_for_new_build_timeout "$job_name" "$build_number" "$once_timeout" > /dev/null; then
                         bg_log_error "no new build detected for ${once_timeout} seconds"
-                        return 2
+                        return "$BUILDGIT_EXIT_NO_NEW_BUILD"
                     fi
                     continue
                 else

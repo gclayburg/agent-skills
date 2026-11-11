@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-BUILDGIT_VERSION="1.4.14-dev"
+BUILDGIT_VERSION="1.4.15-dev"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/jenkins-common.sh"
@@ -53,6 +53,7 @@ source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_agents.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_queue.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_timing.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_pipeline.sh"
+source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_wait.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_cli.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_status_follow.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_job_resolve.sh"
@@ -96,6 +97,7 @@ main() {
         timing)   cmd_timing "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
         pipeline) cmd_pipeline "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
         queue)    cmd_queue "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
+        wait)     cmd_wait "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
         push)     cmd_push "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
         build)    cmd_build "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;
         *)        cmd_passthrough "$COMMAND" "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}" ;;

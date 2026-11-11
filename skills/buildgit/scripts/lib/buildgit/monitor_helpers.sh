@@ -2,6 +2,10 @@
 # failed. Distinct from 0 (success), 1 (failed/error), and 2 (in progress) so
 # a caller can tell "doomed, start diagnosing now" from "finished, failed".
 : "${BUILDGIT_EXIT_BAILED_ON_RED:=3}"
+# Exit code for `status -f --once` when no new build started within the
+# timeout, and for `wait` when there is no build to wait for. Distinct from
+# 2 ("build is in progress"). Spec: buildgit-wait-spec.md § 3, § 4
+: "${BUILDGIT_EXIT_NO_NEW_BUILD:=4}"
 
 # Command that prints the full report for a build once it finishes.
 # Always names the job so it can be pasted from any directory.
@@ -12,19 +16,78 @@ _bail_full_report_command() {
     echo "buildgit --job ${job_name} status ${build_number} --all"
 }
 
+# Command that prints the build's status JSON (failed tests, root cause job).
+# Spec: bail-report-downstream-spec.md § 3
+_bail_json_report_command() {
+    local job_name="$1"
+    local build_number="$2"
+    echo "buildgit --job ${job_name} status ${build_number} --json"
+}
+
+# Command that prints one stage's console. Single quotes in the stage name
+# are escaped so the command can be pasted into a POSIX shell as-is.
+# Spec: bail-report-downstream-spec.md § 3
+_bail_console_text_command() {
+    local job_name="$1"
+    local build_number="$2"
+    local stage_name="$3"
+    local quoted="${stage_name//\'/\'\\\'\'}"
+    echo "buildgit --job ${job_name} status ${build_number} --console-text '${quoted}'"
+}
+
+# For a FAILED root stage that has FAILED nested descendants, name the
+# deepest descendant (earliest to end among equals). The JSON follow path
+# sees root stages only; without this it would report the parent stage of
+# a downstream job instead of the stage that broke.
+# Usage: _bail_refine_failed_stage "stage" "entries_json"
+# Echoes the refined stage path (or the input unchanged).
+# Spec: bail-report-downstream-spec.md § 2
+_bail_refine_failed_stage() {
+    local failed_stage="$1"
+    local entries_json="$2"
+    local refined=""
+
+    if [[ -n "$entries_json" ]]; then
+        refined=$(printf '%s\n' "$entries_json" | jq -r --arg s "$failed_stage" '
+            (if type == "object" then ((.parent // []) + (.nested // [])) else (. // []) end)
+            | map(select((.status // "") == "FAILED"
+                         and ((.name // "") | startswith($s + "->"))))
+            | if length == 0 then empty
+              else
+                sort_by([ -((.name | split("->")) | length),
+                          ((.startTimeMillis // 0) + (.durationMillis // 0)) ])
+                | .[0].name
+              end
+        ' 2>/dev/null) || refined=""
+    fi
+    if [[ -n "$refined" ]]; then
+        echo "$refined"
+    else
+        echo "$failed_stage"
+    fi
+}
+
 # Gather the evidence for a bail-on-red report without printing anything.
-# Usage: _collect_bail_on_red_data "job" "build#" "stage name"
+# Usage: _collect_bail_on_red_data "job" "build#" "stage name" ["stage entries"]
+#   stage entries: the stage tracker's state ({parent, nested}) or a flat
+#   stage array; fetched with _get_nested_stages when omitted.
 # Sets:
 #   _BAIL_EVIDENCE_CONSOLE  console text the error excerpt comes from
 #   _BAIL_CLASSIFICATION    infra | code | unknown
 #   _BAIL_TEST_RESULTS      collected test results JSON array (may be empty)
 #   _BAIL_TEST_RESULTS_RC   0 ok, 2 Jenkins communication failure
 #   _BAIL_FAILED_TESTS      failed test count, or "unknown"
+#   _BAIL_TARGET_JOB, _BAIL_TARGET_BUILD, _BAIL_TARGET_STAGE
+#                           the job/build that run the failed stage and the
+#                           stage's own name there (the root job and the
+#                           full path for a root stage)
+#   _BAIL_TARGET_DOWNSTREAM true when the failed stage runs in a downstream job
 # Shared by the human report and the JSON bail object so both agree.
 _collect_bail_on_red_data() {
     local job_name="$1"
     local build_number="$2"
     local failed_stage="$3"
+    local stage_entries="${4:-}"
 
     _BAIL_EVIDENCE_CONSOLE=""
     _BAIL_CLASSIFICATION="unknown"
@@ -32,8 +95,18 @@ _collect_bail_on_red_data() {
     _BAIL_TEST_RESULTS_RC=0
     _BAIL_FAILED_TESTS="unknown"
 
+    # A nested stage ("Build Handle->Linux Build & Package->Test") runs in a
+    # downstream job; its log, test report and full console live there, not
+    # in the root build, whose console interleaves every parallel stage.
+    # Spec: bail-report-downstream-spec.md § 1, § 2
+    resolve_stage_path_target "$job_name" "$build_number" "$failed_stage" "$stage_entries"
+    _BAIL_TARGET_JOB="$_STAGE_TARGET_JOB"
+    _BAIL_TARGET_BUILD="$_STAGE_TARGET_BUILD"
+    _BAIL_TARGET_STAGE="$_STAGE_TARGET_STAGE"
+    _BAIL_TARGET_DOWNSTREAM="$_STAGE_TARGET_DOWNSTREAM"
+
     local stage_console=""
-    stage_console=$(get_stage_console_output "$job_name" "$build_number" "$failed_stage" 2>/dev/null) || stage_console=""
+    stage_console=$(get_stage_console_output "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$_BAIL_TARGET_STAGE" 2>/dev/null) || stage_console=""
 
     # Pipelines often record JUnit results inside the failing branch before
     # that branch closes, so a test report may already exist at bail time.
@@ -41,7 +114,7 @@ _collect_bail_on_red_data() {
     # this stage triggered is announced there.
     # Spec: bail-on-red-default-spec.md § 6
     local collected="" collected_rc=0
-    if collected=$(collect_downstream_test_results "$job_name" "$build_number" "$stage_console" 2>/dev/null); then
+    if collected=$(collect_downstream_test_results "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$stage_console" 2>/dev/null); then
         collected_rc=0
     else
         collected_rc=$?
@@ -68,15 +141,16 @@ _collect_bail_on_red_data() {
     #
     # So the stage console is treated as a preferred excerpt, not as the
     # evidence. Whenever it cannot account for the failure, fall back to the
-    # whole build console. Reporting "unknown" for a build that is plainly
-    # an infrastructure fault is the one outcome that makes this feature
-    # useless: the caller neither retries nor gets a real diagnosis.
+    # whole console of the build that runs the stage. Reporting "unknown" for
+    # a build that is plainly an infrastructure fault is the one outcome that
+    # makes this feature useless: the caller neither retries nor gets a real
+    # diagnosis.
     local evidence_console="$stage_console"
     local classification=""
     classification=$(classify_build_failure "$stage_console" "$_BAIL_FAILED_TESTS")
     if [[ "$classification" == "unknown" ]]; then
         local full_console=""
-        full_console=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || full_console=""
+        full_console=$(get_console_output "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" 2>/dev/null) || full_console=""
         if [[ -n "$full_console" ]]; then
             local full_classification
             full_classification=$(classify_build_failure "$full_console" "$_BAIL_FAILED_TESTS")
@@ -109,13 +183,20 @@ _json_follow_first_failed_stage() {
 
 # Print the JSON bail-on-red result: the normal status JSON for the build
 # plus a top-level "bail" object. Human-readable text never goes to stdout.
-# Spec: bail-on-red-default-spec.md § 7
+# Spec: bail-on-red-default-spec.md § 7, bail-report-downstream-spec.md § 4
 _emit_json_bail_on_red() {
     local job_name="$1"
     local build_number="$2"
     local failed_stage="$3"
 
-    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage"
+    # Only root stages are visible here; a root stage that triggered a
+    # downstream job is refined to the nested stage that actually failed.
+    local stage_entries=""
+    stage_entries=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || stage_entries=""
+    [[ -z "${stage_entries//[$' \t\r\n']}" ]] && stage_entries="[]"
+    failed_stage=$(_bail_refine_failed_stage "$failed_stage" "$stage_entries")
+
+    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage" "$stage_entries"
 
     local status_json=""
     status_json=$(_jenkins_status_check "$job_name" "true" "$build_number" 2>/dev/null) || true
@@ -128,30 +209,45 @@ _emit_json_bail_on_red() {
         excerpt=$(NO_COLOR=1 extract_error_lines "$_BAIL_EVIDENCE_CONSOLE" 30 2>/dev/null) || excerpt=""
     fi
 
+    local failed_build_json="$_BAIL_TARGET_BUILD"
+    [[ "$failed_build_json" =~ ^[0-9]+$ ]] || failed_build_json="null"
+
     printf '%s\n' "$status_json" | jq \
         --arg stage "$failed_stage" \
         --arg classification "$_BAIL_CLASSIFICATION" \
         --arg excerpt "$excerpt" \
         --arg cmd "$(_bail_full_report_command "$job_name" "$build_number")" \
+        --arg failed_job "$_BAIL_TARGET_JOB" \
+        --argjson failed_build "$failed_build_json" \
+        --arg failed_job_stage "$_BAIL_TARGET_STAGE" \
+        --arg console_cmd "$(_bail_console_text_command "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$_BAIL_TARGET_STAGE")" \
+        --arg json_cmd "$(_bail_json_report_command "$job_name" "$build_number")" \
         '. + {bail: {
             bailed: true,
             failed_stage: $stage,
+            failed_job: $failed_job,
+            failed_build: $failed_build,
+            failed_job_stage: $failed_job_stage,
             classification: $classification,
             error_excerpt: ($excerpt | split("\n") | map(select(length > 0))),
+            console_text_command: $console_cmd,
+            json_report_command: $json_cmd,
             full_report_command: $cmd
         }}'
 }
 
 # Report the stage that triggered bail-on-red and why the build is doomed.
-# Usage: _report_bail_on_red "job" "build#" "stage name"
+# Usage: _report_bail_on_red "job" "build#" "stage name" ["stage entries"]
 #
-# Prints the failing stage, any already-published failed tests, the console
-# excerpt and infra/code classification, then how to get the full report.
-# Spec: bail-on-red-default-spec.md § 5, § 6
+# Prints the failing stage (and, for a nested stage, the downstream job and
+# build that run it), any already-published failed tests, the console
+# excerpt and infra/code classification, then ready-to-run follow-ups.
+# Spec: bail-on-red-default-spec.md § 5, § 6; bail-report-downstream-spec.md § 3
 _report_bail_on_red() {
     local job_name="$1"
     local build_number="$2"
     local failed_stage="$3"
+    local stage_entries="${4:-}"
 
     echo ""
     bg_log_error "Stage '${failed_stage}' FAILED - build #${build_number} cannot pass"
@@ -159,21 +255,34 @@ _report_bail_on_red() {
     # is suppressed unless -v was passed.
     bg_log_essential "Stopped monitoring early (bail-on-red). The build is still running and was NOT cancelled."
 
-    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage"
+    _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage" "$stage_entries"
+
+    local target_label=""
+    if [[ "$_BAIL_TARGET_DOWNSTREAM" == "true" ]]; then
+        target_label="${_BAIL_TARGET_JOB} #${_BAIL_TARGET_BUILD}"
+        bg_log_essential "Failing job: ${target_label}, stage '${_BAIL_TARGET_STAGE}'"
+    fi
 
     # Failed tests that the stage already published. Nothing is printed when
     # no report exists yet or it has no failures: the hint below covers it.
     if [[ "$_BAIL_TEST_RESULTS_RC" -eq 2 ]]; then
-        _note_test_results_comm_failure "$job_name" "$build_number"
+        _note_test_results_comm_failure "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD"
         display_test_results_comm_error
     elif [[ "$_BAIL_FAILED_TESTS" =~ ^[0-9]+$ && "$_BAIL_FAILED_TESTS" -gt 0 ]]; then
         echo ""
         display_hierarchical_test_results "$_BAIL_TEST_RESULTS"
+    elif [[ "$_BAIL_TARGET_DOWNSTREAM" == "true" ]]; then
+        echo ""
+        bg_log_essential "No failed tests published yet by ${target_label}."
     fi
 
     if [[ -n "$_BAIL_EVIDENCE_CONSOLE" ]]; then
+        local errors_title="Stage '${_BAIL_TARGET_STAGE}' Errors"
+        if [[ "$_BAIL_TARGET_DOWNSTREAM" == "true" ]]; then
+            errors_title="${errors_title} (${target_label})"
+        fi
         echo ""
-        echo "${COLOR_YELLOW}=== Stage '${failed_stage}' Errors ===${COLOR_RESET}"
+        echo "${COLOR_YELLOW}=== ${errors_title} ===${COLOR_RESET}"
         extract_error_lines "$_BAIL_EVIDENCE_CONSOLE" 30
         echo "${COLOR_YELLOW}=================================${COLOR_RESET}"
     fi
@@ -181,12 +290,14 @@ _report_bail_on_red() {
     echo "${COLOR_YELLOW}$(format_failure_classification "$_BAIL_CLASSIFICATION")${COLOR_RESET}"
 
     local console_url
-    console_url=$(jenkins_console_url "$job_name" "$build_number" 2>/dev/null) || console_url=""
+    console_url=$(jenkins_console_url "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" 2>/dev/null) || console_url=""
     if [[ -n "$console_url" ]]; then
         bg_log_essential "Full console: ${console_url}"
     fi
 
     bg_log_essential "Build #${build_number} is still running; other stages may still fail."
+    bg_log_essential "Stage log:      $(_bail_console_text_command "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$_BAIL_TARGET_STAGE")"
+    bg_log_essential "Failed tests:   $(_bail_json_report_command "$job_name" "$build_number")"
     bg_log_essential "Full report when it finishes: $(_bail_full_report_command "$job_name" "$build_number")"
 }
 
@@ -686,7 +797,7 @@ __buildgit_monitor_build_impl() {
                     printf '%s\n' "$stage_output"
                 fi
                 _buildgit_iter_cache_end
-                _report_bail_on_red "$job_name" "$build_number" "$first_failed_stage"
+                _report_bail_on_red "$job_name" "$build_number" "$first_failed_stage" "$stage_state"
                 rm -f "$stage_log_file" 2>/dev/null || true
                 rm -f "$stage_state_file" 2>/dev/null || true
                 rm -f "$deferred_log_file" 2>/dev/null || true

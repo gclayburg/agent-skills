@@ -974,6 +974,67 @@ get_stage_console_output() {
     return 0
 }
 
+# Resolve a stage path ("A->B->C") to the job and build that run it.
+# Usage: resolve_stage_path_target "job" "build#" "path" ["stage_entries_json"]
+#   stage_entries_json: a flat stage array, or the stage tracker's
+#   {parent, nested} state. Fetched with _get_nested_stages when omitted.
+# Sets:
+#   _STAGE_TARGET_JOB, _STAGE_TARGET_BUILD  job/build that run the stage
+#   _STAGE_TARGET_STAGE       the stage's own name inside that job
+#   _STAGE_TARGET_DOWNSTREAM  true when the target is a downstream job
+# Entries built while recursing into a downstream build carry
+# downstream_job/downstream_build. A branch-local substage of a downstream
+# job does not, but its parent path does, so shorter prefixes are tried.
+# Always returns 0; an unresolved path targets the given job unchanged.
+# Spec: bail-report-downstream-spec.md § 1
+resolve_stage_path_target() {
+    local job_name="$1"
+    local build_number="$2"
+    local stage_path="$3"
+    local entries_json="${4:-}"
+
+    _STAGE_TARGET_JOB="$job_name"
+    _STAGE_TARGET_BUILD="$build_number"
+    _STAGE_TARGET_STAGE="$stage_path"
+    _STAGE_TARGET_DOWNSTREAM=false
+
+    # Downstream stages are always shown under their parent stage's name.
+    [[ "$stage_path" == *"->"* ]] || return 0
+
+    if [[ -z "$entries_json" ]]; then
+        entries_json=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || entries_json="[]"
+    fi
+    [[ -z "${entries_json//[$' \t\r\n']}" ]] && entries_json="[]"
+
+    local target
+    target=$(printf '%s\n' "$entries_json" | jq -r --arg path "$stage_path" '
+        (if type == "object" then ((.parent // []) + (.nested // [])) else (. // []) end) as $entries
+        | ($path | split("->")) as $segs
+        | [ range($segs | length; 0; -1) as $k
+            | ($segs[0:$k] | join("->")) as $prefix
+            | $entries[]
+            | select((.name // "") == $prefix
+                     and ((.downstream_job // "") != "")
+                     and ((.nesting_depth // 0) > 0)
+                     and ((.downstream_build // "") | tostring | test("^[0-9]+$"))) ]
+        | if length == 0 then empty
+          else .[0] | "\(.downstream_job)\t\(.downstream_build)\t\($segs[-1])"
+          end
+    ' 2>/dev/null) || target=""
+
+    if [[ -n "$target" ]]; then
+        local t_job t_build t_stage
+        IFS=$'\t' read -r t_job t_build t_stage <<< "$target"
+        if [[ -n "$t_job" && -n "$t_build" && -n "$t_stage" ]]; then
+            _STAGE_TARGET_JOB="$t_job"
+            _STAGE_TARGET_BUILD="$t_build"
+            _STAGE_TARGET_STAGE="$t_stage"
+            _STAGE_TARGET_DOWNSTREAM=true
+        fi
+    fi
+    return 0
+}
+
 # Get currently executing stage name from workflow API
 # Usage: get_current_stage "job-name" "build-number"
 # Returns: Stage name if a stage is IN_PROGRESS, empty string otherwise

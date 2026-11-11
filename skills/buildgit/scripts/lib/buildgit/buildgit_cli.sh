@@ -25,13 +25,18 @@ Commands:
                       Show pipeline structure (stages, parallelism, labels)
   queue [--json]
                       Show Jenkins build queue with wait reasons
+  wait [build#] [--queue] [--timeout <seconds>] [--json] [--no-tests]
+                      Wait until a build (default: latest) finishes, then print its result
+                      Never bails on red and never waits for a new build; --queue also waits
+                      until nothing for the job is queued. Exit: 0 SUCCESS, 1 other result,
+                      2 timeout (still running), 4 no build to wait for
   push [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>] [--no-bail-on-red] [git-push-options] [remote] [branch]
                       Push commits and monitor Jenkins build
   build [--no-follow] [--line] [--format <fmt>] [--prior-jobs <N>] [--no-bail-on-red]
                       Trigger and monitor Jenkins build
   Monitoring (push, build, status -f) stops at the first FAILED stage and exits 3
   (bail-on-red); the build keeps running. --no-bail-on-red waits for the full result.
-  --line mode never bails.
+  --line mode never bails. status -f --once exits 4 when no new build starts in time.
   <any-git-command>   Passed through to git
 
 Examples:
@@ -77,6 +82,9 @@ Monitor ongoing Jenkins build jobs:
   buildgit build --line            # Trigger + compact one-line monitoring with progress bar
   buildgit --threads build         # Trigger + show live active-stage progress rows on TTY
   buildgit status -f --prior-jobs 5  # Follow with last 5 builds shown first
+  buildgit wait                    # Wait for the latest build to finish (no bail, no new-build wait)
+  buildgit wait --queue            # ...and until nothing for this branch is queued (safe to push)
+  buildgit wait 42 --timeout 600   # Wait for build #42, give up after 10 minutes (exit 2)
   buildgit --job myjob build       # Trigger build for specific job
   buildgit --job myjob/main status # Query explicit multibranch branch job
 

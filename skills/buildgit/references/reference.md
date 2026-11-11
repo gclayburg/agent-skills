@@ -174,10 +174,52 @@ Stopped monitoring early (bail-on-red). The build is still running and was NOT c
 Classification: code - source or test defect, fix before retrying
 Full console: https://jenkins.example.com/job/phandlemono/job/main/424/console
 Build #424 is still running; other stages may still fail.
+Stage log:      buildgit --job phandlemono/main status 424 --console-text 'E2E Tests Shard 2'
+Failed tests:   buildgit --job phandlemono/main status 424 --json
 Full report when it finishes: buildgit --job phandlemono/main status 424 --all
 ```
 
-`status -f --json --once` prints one JSON object instead: the normal `status --json` output for the running build plus a top-level `bail` object (`bailed`, `failed_stage`, `classification`, `error_excerpt`, `full_report_command`). Builds that finish without a bail have no `bail` key.
+When the failed stage runs in a downstream job, the report names that job and reads the evidence from it:
+
+```text
+[07:06:41] ✗ Stage 'Build Handle->Linux Build & Package->Test' FAILED - build #4 cannot pass
+Stopped monitoring early (bail-on-red). The build is still running and was NOT cancelled.
+Failing job: phandlemono-handle/PH0345-owner-supersession #7, stage 'Test'
+
+No failed tests published yet by phandlemono-handle/PH0345-owner-supersession #7.
+
+=== Stage 'Test' Errors (phandlemono-handle/PH0345-owner-supersession #7) ===
+  ● handleStore › supersedes the previous owner
+  Tests:       1 failed, 212 passed, 213 total
+=================================
+
+Classification: code - source or test defect, fix before retrying
+Full console: https://jenkins.example.com/job/phandlemono-handle/job/PH0345-owner-supersession/7/console
+Build #4 is still running; other stages may still fail.
+Stage log:      buildgit --job phandlemono-handle/PH0345-owner-supersession status 7 --console-text 'Test'
+Failed tests:   buildgit --job phandlemono/PH0345-owner-supersession status 4 --json
+Full report when it finishes: buildgit --job phandlemono/PH0345-owner-supersession status 4 --all
+```
+
+The full stage path also works with `--console-text` on the root job: `buildgit status 4 --console-text 'Build Handle->Linux Build & Package->Test'` prints the same child stage log.
+
+`status -f --json --once` prints one JSON object instead: the normal `status --json` output for the running build plus a top-level `bail` object (`bailed`, `failed_stage`, `failed_job`, `failed_build`, `failed_job_stage`, `classification`, `error_excerpt`, `console_text_command`, `json_report_command`, `full_report_command`). Builds that finish without a bail have no `bail` key.
+
+## Wait for a build to finish (`wait`)
+
+`wait` blocks until one build stops running and prints its `--line` row. It never bails on a failed stage and never waits for a new build, so it is the command to run in the background after a bail, before pushing a fix. The start line goes to stderr; the row (or `--json` object) goes to stdout.
+
+```text
+$ buildgit wait --queue
+[07:27:03] ℹ Waiting for phandlemono/PH0345-owner-supersession #5 to finish (running 9m 12s)...
+FAILURE     #5 id=b188802 Tests=1180/12/4 Took 23m 0s on 2026-11-11T07:32:38-0700 (5 seconds ago)
+$ echo $?
+1
+```
+
+Exit codes: 0 `SUCCESS`, 1 any other result or an error, 2 `--timeout` expired (still running), 4 no build to wait for. `--queue` also waits until no item for the job is queued, and follows a build that starts from the queue meanwhile. An already-finished build is reported at once, with no start line.
+
+`status -f --once[=N]` exits 4 (not 2) when no new build starts within its timeout.
 
 ## Hierarchical downstream test results
 
