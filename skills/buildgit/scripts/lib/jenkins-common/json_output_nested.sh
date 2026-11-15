@@ -283,7 +283,10 @@ _build_stage_agent_map() {
 # Returns: JSON object mapping stage names to {job, build} pairs
 # Example: {"Build Handle": {"job": "downstream-job", "build": 42}}
 _map_stages_to_downstream() {
-    local console_output="$1"
+    local console_output
+    # Perf: the per-stage extraction below only acts on a few line kinds, so
+    # filter the (multi-MB) console down to them once.
+    console_output=$(_console_downstream_mapping_lines "$1")
     local stages_json="$2"
 
     # Perf: pull every stage name out of stages_json in one jq pass; the loop
@@ -654,7 +657,7 @@ _get_nested_stages_uncached() {
             branches=$(_detect_parallel_branches "$console_structure" "$pi_stage_name")
             if [[ -n "$branches" && "$branches" != "[]" ]]; then
                 local branch_substages
-                branch_substages=$(_detect_branch_substages "$console_output" "$pi_stage_name")
+                branch_substages=$(_detect_branch_substages "$console_structure" "$pi_stage_name")
                 if [[ "$blue_nodes_json" != "[]" ]]; then
                     local blue_branch_substages
                     blue_branch_substages=$(_detect_branch_substages_from_blue_ocean "$stages_json" "$blue_nodes_json" "$pi_stage_name" "$branches")

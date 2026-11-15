@@ -436,7 +436,7 @@ _get_follow_active_stages() {
             mapping_branch_names=$(_detect_parallel_branches "$console_structure" "$mapping_wrapper_name")
             [[ -z "$mapping_branch_names" || "$mapping_branch_names" == "[]" ]] && continue
 
-            mapping_branch_substages=$(_detect_branch_substages "$console_output" "$mapping_wrapper_name")
+            mapping_branch_substages=$(_detect_branch_substages "$console_structure" "$mapping_wrapper_name")
             [[ -z "$mapping_branch_substages" || "$mapping_branch_substages" == "null" ]] && mapping_branch_substages="{}"
             if [[ "$blue_nodes_json" != "[]" && "$wfapi_stage_details_json" != "[]" ]]; then
                 local mapping_blue_branch_substages

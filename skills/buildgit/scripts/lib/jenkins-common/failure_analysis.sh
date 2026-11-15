@@ -395,6 +395,19 @@ _console_pipeline_structure() {
     printf '%s\n' "$1" | LC_ALL=C grep -F '[Pipeline]' || true
 }
 
+# Reduce console output to the lines that decide which stage triggered which
+# downstream build: "[Pipeline]" structure lines (extract_stage_logs block
+# tracking, _select_downstream_build_for_stage block counts) and the
+# "Starting building:" / "build #N completed" lines that
+# detect_all_downstream_builds reads. A caller that maps every stage of one
+# multi-MB console filters it once and runs the per-stage extraction on the
+# result, instead of re-scanning the whole log once per stage (a 6.5MB,
+# 34-stage console: 16s -> well under 1s, with an identical mapping).
+# Usage: mapping_lines=$(_console_downstream_mapping_lines "$console_output")
+_console_downstream_mapping_lines() {
+    printf '%s\n' "$1" | LC_ALL=C grep -E '\[Pipeline\]|Starting building:|build #[0-9]+ completed' || true
+}
+
 # Usage: _detect_parallel_branches "$console_output" "wrapper-stage-name"
 # Returns: JSON array of branch names, e.g. ["Build Handle", "Build SignalBoot"]
 #          Returns empty string if stage is not a parallel wrapper
@@ -505,10 +518,14 @@ _detect_parallel_branches() {
 }
 
 # Detect ordered named substages contained within each parallel branch block.
-# Usage: _detect_branch_substages "$console_output" "wrapper-stage-name"
+# Usage: _detect_branch_substages "$console_output_or_structure" "wrapper-stage-name"
 # Returns: JSON object like {"Branch A":["Setup","Test"],"Branch B":[]}
 _detect_branch_substages() {
-    local console_output="$1"
+    local console_output
+    # Perf: only "[Pipeline]" structure lines are acted on below, so drop the
+    # rest before the per-line jq reduce (which is slow on a multi-MB console).
+    # Callers may pass an already-filtered structure; filtering is idempotent.
+    console_output=$(_console_pipeline_structure "$1")
     local wrapper_stage="$2"
 
     local branches_json

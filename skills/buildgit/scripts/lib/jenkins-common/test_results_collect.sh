@@ -94,7 +94,9 @@ fetch_test_results() {
 }
 
 _map_downstream_stage_labels() {
-    local console_output="$1"
+    local console_output
+    # Perf: see _console_downstream_mapping_lines.
+    console_output=$(_console_downstream_mapping_lines "$1")
     local stages_json="$2"
 
     local result="{}"
@@ -598,14 +600,26 @@ display_hierarchical_test_results() {
     local max_failed_width=${#failed_sum}
     local max_skipped_width=${#skipped_sum}
 
+    # Perf: collected_json embeds each build's full test report (multi-MB on
+    # large suites), so read the short per-row fields for every row in one jq
+    # pass rather than re-parsing the whole document once per field per row.
+    local -a row_stage_labels=() row_depths=() row_jobs=() row_build_numbers=()
+    local _row_fsep=$'\x1f' _row_stage _row_depth _row_job _row_build
+    while IFS="$_row_fsep" read -r _row_stage _row_depth _row_job _row_build; do
+        row_stage_labels+=("$_row_stage")
+        row_depths+=("$_row_depth")
+        row_jobs+=("$_row_job")
+        row_build_numbers+=("$_row_build")
+    done < <(echo "$collected_json" | jq -r '.[] | [(.stage // .job // ""), ((.depth // 0) | tostring), (.job // ""), ((.build_number // "") | tostring)] | join("\u001f")' 2>/dev/null)
+
     local i=0
     while [[ "$i" -lt "$count" ]]; do
         local stage_label depth job build_number test_json indent label job_display summary total passed failed skipped line_color
 
-        stage_label=$(echo "$collected_json" | jq -r ".[$i].stage // .[$i].job // empty")
-        depth=$(echo "$collected_json" | jq -r ".[$i].depth // 0")
-        job=$(echo "$collected_json" | jq -r ".[$i].job // empty")
-        build_number=$(echo "$collected_json" | jq -r ".[$i].build_number // empty")
+        stage_label="${row_stage_labels[$i]:-}"
+        depth="${row_depths[$i]:-0}"
+        job="${row_jobs[$i]:-}"
+        build_number="${row_build_numbers[$i]:-}"
         test_json=$(echo "$collected_json" | jq -r ".[$i].test_json // empty")
         indent=$(_indent_spaces $((depth * 2)))
         label="${indent}${stage_label}"
