@@ -225,9 +225,11 @@ cmd_push() {
     fi
     local job_name="$_VALIDATED_JOB_NAME"
 
-    # Record baseline build number
-    local baseline_build
-    baseline_build=$(get_last_build_number "$job_name")
+    # The first build may have started while Jenkins indexed the new branch.
+    local baseline_build=0
+    if [[ "${_VALIDATED_JOB_WAS_MISSING:-false}" != true ]]; then
+        baseline_build=$(get_last_build_number "$job_name")
+    fi
     bg_log_info "Current build baseline: #${baseline_build}"
 
     local hook_signal hook_kind hook_value hook_detail queue_url=""

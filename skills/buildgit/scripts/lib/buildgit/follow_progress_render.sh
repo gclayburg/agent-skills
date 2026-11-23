@@ -273,20 +273,10 @@ _render_follow_line_queued() {
 }
 
 _render_follow_thread_progress_line() {
-    local stage_json="$1"
-    local estimates_json="$2"
-    local frame="${3:-0}"
-    local terminal_cols="${4:-80}"
+    local stage_name="$1" agent_name="$2" start_ms="$3" duration_ms="$4" estimate_ms="$5"
+    local frame="$6" terminal_cols="$7" now_ms="$8"
 
-    local stage_name agent_name start_ms duration_ms
-    stage_name=$(echo "$stage_json" | jq -r '.name // "unknown"' 2>/dev/null) || stage_name="unknown"
-    agent_name=$(echo "$stage_json" | jq -r '.agent // .execNode // .node // "unknown"' 2>/dev/null) || agent_name="unknown"
-    start_ms=$(echo "$stage_json" | jq -r '.startTimeMillis // 0' 2>/dev/null) || start_ms=0
-    duration_ms=$(echo "$stage_json" | jq -r '.durationMillis // 0' 2>/dev/null) || duration_ms=0
-
-    local now_ms elapsed_ms
-    now_ms=$(($(date +%s) * 1000))
-    elapsed_ms=0
+    local elapsed_ms=0
     if [[ "$duration_ms" =~ ^[1-9][0-9]*$ ]]; then
         elapsed_ms="$duration_ms"
     elif [[ "$start_ms" =~ ^[1-9][0-9]*$ ]]; then
@@ -294,14 +284,6 @@ _render_follow_thread_progress_line() {
         if [[ "$elapsed_ms" -lt 0 ]]; then
             elapsed_ms=0
         fi
-    fi
-
-    local estimate_ms
-    estimate_ms=$(echo "$estimates_json" | jq -r --arg name "$stage_name" '.[$name] // empty' 2>/dev/null) || estimate_ms=""
-    if [[ -z "$estimate_ms" && "$stage_name" == *"->"* ]]; then
-        local substage_name
-        substage_name="${stage_name##*->}"
-        estimate_ms=$(echo "$estimates_json" | jq -r --arg name "$substage_name" '.[$name] // empty' 2>/dev/null) || estimate_ms=""
     fi
 
     local agent_display bar percent_display elapsed_display estimate_display
@@ -369,14 +351,15 @@ _render_follow_thread_progress_lines() {
     fi
     [[ -z "$stages_json" || "$stages_json" == "null" ]] && stages_json="[]"
 
-    local active_stages
-    active_stages=$(echo "$stages_json" | jq -c '[.[] | select((.status // "") == "IN_PROGRESS" and (.is_parallel_wrapper // false) != true)]' 2>/dev/null) || active_stages="[]"
-
-    local active_count
-    active_count=$(echo "$active_stages" | jq -r 'length' 2>/dev/null) || active_count=0
-    if [[ "$active_count" -le 0 ]]; then
-        return 0
-    fi
+    local -a rows
+    mapfile -d '' -t rows < <(jq -j --argjson estimates "$_FOLLOW_STAGE_ESTIMATES_JSON" '
+        .[] | select(.status == "IN_PROGRESS" and .is_parallel_wrapper != true)
+        | (.name // "unknown") as $name
+        | [$name, (.agent // .execNode // .node // "unknown"), (.startTimeMillis // 0),
+           (.durationMillis // 0), ($estimates[$name] // $estimates[$name | split("->") | last] // ""), ""]
+        | join("\u001f") + "\u0000"
+    ' <<< "$stages_json" 2>/dev/null)
+    (( ${#rows[@]} > 0 )) || return 0
 
     local terminal_rows terminal_cols max_stage_lines
     terminal_rows=$(_get_follow_progress_terminal_rows)
@@ -386,16 +369,12 @@ _render_follow_thread_progress_lines() {
         return 0
     fi
 
-    local entries idx=0
-    entries=$(echo "$active_stages" | jq -c '.[]' 2>/dev/null) || entries=""
-    while IFS= read -r stage_entry; do
-        [[ -z "$stage_entry" ]] && continue
-        if [[ "$idx" -ge "$max_stage_lines" ]]; then
-            break
-        fi
-        _render_follow_thread_progress_line "$stage_entry" "$_FOLLOW_STAGE_ESTIMATES_JSON" "$frame" "$terminal_cols"
-        idx=$((idx + 1))
-    done <<< "$entries"
+    local row name agent start_ms duration_ms estimate_ms unused now_ms
+    now_ms=$(($(date +%s) * 1000))
+    for row in "${rows[@]:0:max_stage_lines}"; do
+        IFS=$'\x1f' read -r -d '' name agent start_ms duration_ms estimate_ms unused <<< "$row" || true
+        _render_follow_thread_progress_line "$name" "$agent" "$start_ms" "$duration_ms" "$estimate_ms" "$frame" "$terminal_cols" "$now_ms"
+    done
 }
 
 _redraw_follow_line_progress_lines() {
@@ -641,8 +620,12 @@ _monitor_build_line_mode() {
     local estimate_ms=""
     local showed_progress=false
     local build_json building
+    local monitor_stage_snapshot=""
 
     if [[ "$interactive_line_mode" == "true" ]]; then
+        if [[ "$THREADS_MODE" == "true" ]]; then
+            _console_session_cache_begin
+        fi
         _prime_follow_progress_estimates "$job_name"
         estimate_ms="${_FOLLOW_BUILD_ESTIMATE_MS:-}"
     fi
@@ -664,7 +647,10 @@ _monitor_build_line_mode() {
         if [[ "$interactive_line_mode" == "true" ]]; then
             local stages_json=""
             if [[ "$THREADS_MODE" == "true" ]]; then
+                _buildgit_iter_cache_begin
+                monitor_stage_snapshot=$(_get_live_pipeline_snapshot "$job_name" "$build_number") || monitor_stage_snapshot=""
                 stages_json=$(_get_follow_active_stages "$job_name" "$build_number")
+                _buildgit_iter_cache_end
             fi
             _display_follow_line_progress "$job_name" "$build_number" "$build_json" "$estimate_ms" "$line_frame" "$include_queue_lines" "$stages_json"
             showed_progress=true
@@ -674,6 +660,9 @@ _monitor_build_line_mode() {
         elapsed=$((elapsed + POLL_INTERVAL))
         line_frame=$((line_frame + 1))
     done
+    if [[ "$interactive_line_mode" == "true" && "$THREADS_MODE" == "true" ]]; then
+        _console_session_cache_end
+    fi
 
     if [[ "${building:-true}" == "true" ]]; then
         if [[ "$showed_progress" == "true" ]]; then

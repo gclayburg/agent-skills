@@ -2,7 +2,7 @@
 
 `buildgit` sits on top of an existing git + Jenkins setup. You'll need:
 
-- **bash**, **curl**, **jq**
+- **Bash 5.0 or newer**, **curl**, **jq**. On macOS, install Bash with `brew install bash`. `buildgit` can find Bash in the standard Homebrew locations when launched by system Bash. On Linux, put Bash 5+ on `PATH`.
 - **Git** for your project, with a remote repository
 - **Jenkins** with a **Pipeline** or **Multibranch Pipeline** job for your project (freestyle jobs are not supported)
 - **Automatic build triggers** — your git remote must be configured to trigger a Jenkins build on every push (e.g. via a webhook, a git post-receive hook, or a Jenkins plugin like GitHub Branch Source). buildgit monitors builds; it doesn't create the link between your repo and Jenkins. See [post-receive-hook.md](post-receive-hook.md) for a reference hook implementation.

@@ -54,7 +54,10 @@ _build_parallel_tracking_state() {
     local previous_parallel_state="$2"
     [[ -z "$previous_parallel_state" ]] && previous_parallel_state="{}"
     local build_info_json current_building="true"
-    build_info_json=$(get_build_info "$job_name" "$build_number" 2>/dev/null) || true
+    build_info_json="${monitor_build_info:-}"
+    if [[ -z "$build_info_json" ]]; then
+        build_info_json=$(get_build_info "$job_name" "$build_number" 2>/dev/null) || true
+    fi
     if [[ -n "$build_info_json" ]]; then
         current_building=$(echo "$build_info_json" | jq -r 'if has("building") and .building != null then .building else true end' 2>/dev/null)
         [[ -z "$current_building" || "$current_building" == "null" ]] && current_building="true"
@@ -544,7 +547,7 @@ _stage_awaits_console_structure() {
     local stage_index="$1"
     local stage_name="${_ts_names[$stage_index]}"
 
-    [[ "$stage_name" == *"->"* || -n "${_ts_parallel_wrapper[$stage_index]}" ]] && return 1
+    [[ -n "${monitor_stage_snapshot:-}" || "$stage_name" == *"->"* || -n "${_ts_parallel_wrapper[$stage_index]}" ]] && return 1
 
     if [[ "$_ts_unsettled_loaded" != "true" ]]; then
         _ts_unsettled_loaded=true
@@ -816,23 +819,32 @@ _track_nested_stage_changes() {
     fi
 
     local _ts_dbg_t0 _ts_dbg_t1 _ts_dbg_t2 _ts_dbg_t3 _ts_dbg_t3b _ts_dbg_t4
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t0=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    local snapshot="${monitor_stage_snapshot:-}"
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t0=$((${EPOCHREALTIME/./} / 1000))
 
     local current_parent_stages
-    current_parent_stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || current_parent_stages="[]"
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t1=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    if [[ -n "$snapshot" ]]; then
+        current_parent_stages=$(jq -c '.parent' <<< "$snapshot")
+    else
+        current_parent_stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || current_parent_stages="[]"
+    fi
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t1=$((${EPOCHREALTIME/./} / 1000))
 
     local current_nested
-    current_nested=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || current_nested="[]"
+    if [[ -n "$snapshot" ]]; then
+        current_nested=$(jq -c '.nested' <<< "$snapshot")
+    else
+        current_nested=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || current_nested="[]"
+    fi
     if [[ -z "$current_nested" || "$current_nested" == "null" ]]; then
         current_nested="[]"
     fi
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t2=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t2=$((${EPOCHREALTIME/./} / 1000))
 
     local parallel_state
     parallel_state=$(_build_parallel_tracking_state "$current_nested" "$previous_parallel_state")
     [[ -z "$parallel_state" || "$parallel_state" == "null" ]] && parallel_state="{}"
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3=$((${EPOCHREALTIME/./} / 1000))
 
     # Perf: batch-extract per-stage fields + per-stage lookups against
     # previous_nested and printed_state in a single jq pass. All loop-body
@@ -907,7 +919,7 @@ _track_nested_stage_changes() {
         ] | join($sep)
     ' 2>/dev/null)
 
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3b=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t3b=$((${EPOCHREALTIME/./} / 1000))
 
     local stage_count=${#_ts_names[@]}
     # Filled on first use by _stage_awaits_console_structure (once per poll).
@@ -1051,7 +1063,7 @@ _track_nested_stage_changes() {
 
         i=$((i + 1))
     done
-    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t4=$(perl -MTime::HiRes -e 'printf "%d\n", Time::HiRes::time()*1000')
+    [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]] && _ts_dbg_t4=$((${EPOCHREALTIME/./} / 1000))
 
     local tracking_complete=false
     if _nested_tracking_complete "$current_nested" "$current_parent_stages" "$printed_state"; then

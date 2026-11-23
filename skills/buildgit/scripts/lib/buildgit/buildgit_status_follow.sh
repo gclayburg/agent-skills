@@ -153,6 +153,10 @@ _cmd_status_follow() {
                 fi
             elif [[ "$json_mode" == "true" && "$once_mode" == "true" ]]; then
                 local elapsed=0
+                local monitor_stage_snapshot=""
+                if [[ "${BAIL_ON_RED:-false}" == "true" ]]; then
+                    _console_session_cache_begin
+                fi
                 while [[ $MAX_BUILD_TIME -le 0 || $elapsed -lt $MAX_BUILD_TIME ]]; do
                     build_json=$(get_build_info "$job_name" "$build_number")
                     if [[ -z "$build_json" ]]; then
@@ -170,9 +174,11 @@ _cmd_status_follow() {
                     # Spec: bail-on-red-default-spec.md § 7
                     if [[ "${BAIL_ON_RED:-false}" == "true" ]]; then
                         local json_failed_stage
+                        monitor_stage_snapshot=$(_get_live_pipeline_snapshot "$job_name" "$build_number") || monitor_stage_snapshot=""
                         json_failed_stage=$(_json_follow_first_failed_stage "$job_name" "$build_number")
                         if [[ -n "$json_failed_stage" ]]; then
                             _emit_json_bail_on_red "$job_name" "$build_number" "$json_failed_stage"
+                            _console_session_cache_end
                             return "$BUILDGIT_EXIT_BAILED_ON_RED"
                         fi
                     fi
@@ -180,6 +186,9 @@ _cmd_status_follow() {
                     sleep "$POLL_INTERVAL"
                     elapsed=$((elapsed + POLL_INTERVAL))
                 done
+                if [[ "${BAIL_ON_RED:-false}" == "true" ]]; then
+                    _console_session_cache_end
+                fi
 
                 if [[ "$building" == "true" ]]; then
                     bg_log_error "Build #${build_number} did not complete within ${MAX_BUILD_TIME}s timeout"

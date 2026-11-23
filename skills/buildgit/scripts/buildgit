@@ -1,7 +1,21 @@
 #!/usr/bin/env bash
 
+# The bootstrap also runs under macOS's system Bash, which can be first on
+# PATH in non-interactive callers such as Codex.
+if (( BASH_VERSINFO[0] < 5 )); then
+    if [[ "${BASH_SOURCE[0]}" == "$0" && "$OSTYPE" == darwin* ]]; then
+        for buildgit_bash in "$(command -v bash)" "${HOMEBREW_PREFIX:+$HOMEBREW_PREFIX/bin/bash}" /opt/homebrew/bin/bash /usr/local/bin/bash; do
+            if [[ -x "$buildgit_bash" ]] && "$buildgit_bash" -c '(( BASH_VERSINFO[0] >= 5 ))'; then
+                exec "$buildgit_bash" "$0" "$@"
+            fi
+        done
+    fi
+    printf 'buildgit requires Bash 5 or newer. Install Bash and put it on PATH (macOS: brew install bash).\n' >&2
+    exit 2
+fi
+
 set -euo pipefail
-BUILDGIT_VERSION="1.4.16-dev"
+BUILDGIT_VERSION="1.4.17-dev"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/jenkins-common.sh"
@@ -56,7 +70,6 @@ source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_pipeline.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/cmd_wait.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_cli.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_status_follow.sh"
-source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_job_resolve.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_status_cmd.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/buildgit/buildgit_push_build.sh"
 

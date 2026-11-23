@@ -182,7 +182,7 @@ For failures, summarize the failed stage name, error logs, and test failure deta
 When a failure needs more detail, prefer `scripts/buildgit -v status --json` for structured failed-test stdout and `scripts/buildgit status --console-text <stage>` after `scripts/buildgit status --list-stages`.
 `--console-text <stage>` accepts exact, case-insensitive, and unique partial stage matches. If the requested parent stage has no direct log text, it walks descendant substages and emits their logs in pipeline order. A full stage path as printed by a bail report or `status --json` (`Build Handle->Linux Build & Package->Test`) also works on the root job: when the path belongs to a downstream job, buildgit reads that job's stage (`Test` in `phandlemono-handle/<branch>`).
 Normal build/status output goes to stdout, including queue updates, stage progress, completion summaries, and verbose diagnostics. stderr is reserved for invalid input, Jenkins communication failures, and transient TTY redraw sequences.
-With `BUILDGIT_DEBUG_TIMING=1`, monitoring commands also emit `[buildgit-timing] iter=<N> build_info=<ms> stage_track=<ms> total=<ms> building=<bool>` to stderr; the values use second-precision timestamps scaled to milliseconds for bash 3.2 portability. After completion they emit `[buildgit-settle] iterations=<n> elapsed=<s> stable_polls=<n> tracking_complete=<bool> verified_exit=<bool> flushes=<n>` summarizing the post-completion settle phase (`verified_exit=true` = early exit because a completion flush agreed with an independent tracker sample).
+With `BUILDGIT_DEBUG_TIMING=1`, monitoring commands also emit `[buildgit-timing] iter=<N> build_info=<ms> stage_track=<ms> total=<ms> building=<bool>` to stderr; the values use millisecond measurements from Bash 5. After completion they emit `[buildgit-settle] iterations=<n> elapsed=<s> stable_polls=<n> tracking_complete=<bool> verified_exit=<bool> flushes=<n>` summarizing the post-completion settle phase (`verified_exit=true` = early exit because a completion flush agreed with an independent tracker sample).
 Full header output is condensed: `Trigger:` merges cause plus user (`Manual by …`, `SCM change`, `Timer`, `Upstream`), `Commit:` includes the subject line when available, and `Agent:` is a top-level field instead of a boxed Build Info section.
 For jobs that trigger downstream builds, full output now shows a hierarchical `=== Test Results ===` tree with parent and child rows, while one-line output aggregates the `Tests=` counts across the whole tree. In `--json`, the top-level `test_results` totals match the line output and multi-job builds add a `breakdown` array with one entry per parent/downstream build; missing reports are represented as `null` counts.
 
@@ -315,9 +315,10 @@ a top-level `bail` object:
 ```
 
 For a stage of the root job, `failed_job` / `failed_build` are the root job
-and build and `failed_job_stage` equals `failed_stage`. The JSON path sees
-only root stages while it polls; when a root stage that triggered a
-downstream job fails, it reports the deepest failed stage inside it.
+and build and `failed_job_stage` equals `failed_stage`. With Pipeline Graph View,
+JSON follow checks root and downstream stages from the shared snapshot. On
+older controllers, it checks root stages and resolves a failed downstream
+stage when it builds the report.
 
 Builds that finish without a bail have no `bail` key, so test `has("bail")`.
 

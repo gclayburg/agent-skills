@@ -346,8 +346,12 @@ _get_stage_duration_estimates_for_build() {
         return 0
     fi
 
-    local nested_stages_json
-    nested_stages_json=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || nested_stages_json="[]"
+    local nested_stages_json snapshot
+    if snapshot=$(_get_live_pipeline_snapshot "$job_name" "$build_number"); then
+        nested_stages_json=$(jq -c '.nested' <<< "$snapshot")
+    else
+        nested_stages_json=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || nested_stages_json="[]"
+    fi
     if [[ -z "$nested_stages_json" || "$nested_stages_json" == "null" ]]; then
         echo "{}"
         return 0
@@ -386,6 +390,10 @@ _prime_follow_progress_estimates() {
 _get_follow_active_stages() {
     local job_name="$1"
     local build_number="$2"
+    if [[ -n "${monitor_stage_snapshot:-}" ]]; then
+        jq -c '.active' <<< "$monitor_stage_snapshot"
+        return
+    fi
     if ! [[ "$build_number" =~ ^[1-9][0-9]*$ ]]; then
         echo "[]"
         return 0
@@ -402,16 +410,12 @@ _get_follow_active_stages() {
     base_stages_json=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || base_stages_json="[]"
     [[ -z "$base_stages_json" || "$base_stages_json" == "null" ]] && base_stages_json="[]"
     wfapi_stage_details_json="[]"
-    local job_path
-    job_path=$(jenkins_job_path "$job_name")
-    if [[ -n "$job_path" ]]; then
-        local wfapi_response
-        wfapi_response=$(jenkins_api "${job_path}/${build_number}/wfapi/describe" 2>/dev/null) || true
-        if [[ -n "$wfapi_response" ]]; then
-            wfapi_stage_details_json=$(echo "$wfapi_response" | jq -c '.stages // []' 2>/dev/null) || wfapi_stage_details_json="[]"
-        fi
+    local wfapi_response console_structure=""
+    wfapi_response=$(get_workflow_description "$job_name" "$build_number") || true
+    if [[ -n "$wfapi_response" ]]; then
+        wfapi_stage_details_json=$(jq -c '.stages // []' <<< "$wfapi_response" 2>/dev/null) || wfapi_stage_details_json="[]"
     fi
-    console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || console_output=""
+    console_output=$(get_console_output_cached "$job_name" "$build_number" 2>/dev/null) || console_output=""
     stage_agent_map="{}"
     pipeline_scope_agent=""
     local branch_to_wrapper_json substage_to_branch_json
@@ -425,7 +429,6 @@ _get_follow_active_stages() {
         blue_nodes_json=$(get_blue_ocean_nodes "$job_name" "$build_number" 2>/dev/null) || blue_nodes_json="[]"
         [[ -z "$blue_nodes_json" || "$blue_nodes_json" == "null" ]] && blue_nodes_json="[]"
 
-        local console_structure
         console_structure=$(_console_pipeline_structure "$console_output")
         local mapping_wrapper_names mapping_wrapper_name
         mapping_wrapper_names=$(echo "$base_stages_json" | jq -r '.[].name // empty' 2>/dev/null) || mapping_wrapper_names=""
@@ -491,15 +494,13 @@ _get_follow_active_stages() {
     local wrapper_lines
     wrapper_lines=$(echo "$base_stages_json" | jq -r '.[] | [.name, (.status // ""), (.startTimeMillis // 0), (.durationMillis // 0)] | @tsv' 2>/dev/null) || wrapper_lines=""
 
-    local wrapper_structure=""
-    [[ -n "$console_output" ]] && wrapper_structure=$(_console_pipeline_structure "$console_output")
     local wrapper_name wrapper_status wrapper_start_ms wrapper_duration_ms
     while IFS=$'\t' read -r wrapper_name wrapper_status wrapper_start_ms wrapper_duration_ms; do
         [[ -z "$wrapper_name" ]] && continue
         [[ -z "$console_output" ]] && continue
 
         local branch_names
-        branch_names=$(_detect_parallel_branches "$wrapper_structure" "$wrapper_name")
+        branch_names=$(_detect_parallel_branches "$console_structure" "$wrapper_name")
         [[ -z "$branch_names" || "$branch_names" == "[]" ]] && continue
 
         local active_branch_count

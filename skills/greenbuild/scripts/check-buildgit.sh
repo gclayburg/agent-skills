@@ -34,7 +34,11 @@ fi
 buildgit_dir="$(cd "$(dirname "$buildgit_path")" && pwd)"
 buildgit_abs="${buildgit_dir}/$(basename "$buildgit_path")"
 
-version_line="$(bash "$buildgit_abs" --version 2>/dev/null | head -1)" || version_line=""
+if ! version_output=$(bash "$buildgit_abs" --version); then
+    echo "greenbuild: could not run buildgit at ${buildgit_abs}" >&2
+    exit 1
+fi
+version_line="${version_output%%$'\n'*}"
 version="${version_line#buildgit }"
 core="${version%%-*}"
 

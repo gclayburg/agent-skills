@@ -1016,8 +1016,7 @@ extract_triggering_commit() {
 #   unknown - not recognised; neither retry nor diagnosis is clearly right
 
 # Console patterns that indicate the infrastructure failed, not the code.
-# Each is drawn from a failure this project has actually observed. Kept as a
-# newline-delimited string rather than an array so bash 3.2 handles it.
+# Each pattern is drawn from a failure this project has actually observed.
 #
 # "Timeout after N seconds" is deliberately NOT on its own: a test suite that
 # blows its own timeout prints the same shape. It only counts as infra when
@@ -1107,26 +1106,15 @@ classify_build_failure() {
 
     # Code evidence beats a bare infra pattern: a stack trace mentioning a
     # closed channel can appear in an otherwise ordinary test failure.
-    local pattern
-    while IFS= read -r pattern; do
-        [[ -z "$pattern" ]] && continue
-        if grep -qE "$pattern" <<< "$console_output" 2>/dev/null; then
-            echo "code"
-            return 0
-        fi
-    done <<EOF
-${_BUILDGIT_CODE_PATTERNS}
-EOF
+    if grep -qE -f <(printf '%s\n' "$_BUILDGIT_CODE_PATTERNS") <<< "$console_output" 2>/dev/null; then
+        echo "code"
+        return 0
+    fi
 
-    while IFS= read -r pattern; do
-        [[ -z "$pattern" ]] && continue
-        if grep -qE "$pattern" <<< "$console_output" 2>/dev/null; then
-            echo "infra"
-            return 0
-        fi
-    done <<EOF
-${_BUILDGIT_INFRA_PATTERNS}
-EOF
+    if grep -qE -f <(printf '%s\n' "$_BUILDGIT_INFRA_PATTERNS") <<< "$console_output" 2>/dev/null; then
+        echo "infra"
+        return 0
+    fi
 
     echo "unknown"
     return 0

@@ -94,6 +94,7 @@ _collect_bail_on_red_data() {
     _BAIL_TEST_RESULTS=""
     _BAIL_TEST_RESULTS_RC=0
     _BAIL_FAILED_TESTS="unknown"
+    local BUILDGIT_HTTP_DEADLINE=$((EPOCHSECONDS + 8))
 
     # A nested stage ("Build Handle->Linux Build & Package->Test") runs in a
     # downstream job; its log, test report and full console live there, not
@@ -105,8 +106,12 @@ _collect_bail_on_red_data() {
     _BAIL_TARGET_STAGE="$_STAGE_TARGET_STAGE"
     _BAIL_TARGET_DOWNSTREAM="$_STAGE_TARGET_DOWNSTREAM"
 
-    local stage_console=""
-    stage_console=$(get_stage_console_output "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$_BAIL_TARGET_STAGE" 2>/dev/null) || stage_console=""
+    local stage_console="" stage_node_id=""
+    if [[ -n "${monitor_stage_snapshot:-}" ]]; then
+        stage_node_id=$(jq -r --arg name "$failed_stage" 'first(.nested[] | select(.name == $name) | .id) // empty' \
+            <<< "$monitor_stage_snapshot")
+    fi
+    stage_console=$(get_stage_console_output "$_BAIL_TARGET_JOB" "$_BAIL_TARGET_BUILD" "$_BAIL_TARGET_STAGE" "$stage_node_id" 2>/dev/null) || stage_console=""
 
     # Pipelines often record JUnit results inside the failing branch before
     # that branch closes, so a test report may already exist at bail time.
@@ -175,9 +180,13 @@ _json_follow_first_failed_stage() {
     local job_name="$1"
     local build_number="$2"
 
+    if [[ -n "${monitor_stage_snapshot:-}" ]]; then
+        _find_first_failed_stage "$monitor_stage_snapshot"
+        return
+    fi
     local stages
     stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || stages="[]"
-    [[ -z "${stages//[$' \t\r\n']}" ]] && stages="[]"
+    [[ "$stages" == *[!$' \t\r\n']* ]] || stages="[]"
     _find_first_failed_stage "{\"parent\": ${stages}, \"nested\": []}"
 }
 
@@ -192,8 +201,12 @@ _emit_json_bail_on_red() {
     # Only root stages are visible here; a root stage that triggered a
     # downstream job is refined to the nested stage that actually failed.
     local stage_entries=""
-    stage_entries=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || stage_entries=""
-    [[ -z "${stage_entries//[$' \t\r\n']}" ]] && stage_entries="[]"
+    if [[ -n "${monitor_stage_snapshot:-}" ]]; then
+        stage_entries=$(jq -c '.nested' <<< "$monitor_stage_snapshot")
+    else
+        stage_entries=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || stage_entries=""
+    fi
+    [[ "$stage_entries" == *[!$' \t\r\n']* ]] || stage_entries="[]"
     failed_stage=$(_bail_refine_failed_stage "$failed_stage" "$stage_entries")
 
     _collect_bail_on_red_data "$job_name" "$build_number" "$failed_stage" "$stage_entries"
@@ -411,16 +424,6 @@ _monitor_build_finished_mid_iteration() {
     [[ "$(echo "$info" | jq -r 'if .building == false and (.result // "") != "" then "done" else "" end' 2>/dev/null)" == "done" ]]
 }
 
-_buildgit_timing_ms() {
-    local start="$1"
-    local finish="$2"
-    local seconds=$((finish - start))
-    if [[ "$seconds" -lt 0 ]]; then
-        seconds=0
-    fi
-    echo $((seconds * 1000))
-}
-
 # Unified build monitoring loop
 # Polls Jenkins API until build completes, tracking stage changes in real-time
 # Arguments: job_name, build_number
@@ -442,6 +445,7 @@ __buildgit_monitor_build_impl() {
     local stage_state_file=""
     local deferred_log_file=""
     local iter_num=0
+    local monitor_stage_snapshot="" monitor_build_info=""
     stage_state_file="$(mktemp "${TMPDIR:-/tmp}/buildgit-stage-state.XXXXXX")"
     if [[ "$show_progress_footer" == "true" ]]; then
         if _status_stdout_is_tty; then
@@ -467,22 +471,25 @@ __buildgit_monitor_build_impl() {
 
     while [[ $MAX_BUILD_TIME -le 0 || $elapsed -lt $MAX_BUILD_TIME ]]; do
         iter_num=$((iter_num + 1))
+        monitor_stage_snapshot=""
+        monitor_build_info=""
         local iter_start=""
         local build_info_start=""
         local build_info_end=""
         local build_info_ms=0
         local stage_track_ms=0
         iter_start=$(date +%s)
+        local iter_start_us="${EPOCHREALTIME/./}"
         local iter_start_seconds=$SECONDS
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
-            build_info_start="$iter_start"
+            build_info_start="$iter_start_us"
         fi
 
         local build_info
         build_info=$(get_build_info "$job_name" "$build_number")
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
-            build_info_end=$(date +%s)
-            build_info_ms=$(_buildgit_timing_ms "$build_info_start" "$build_info_end")
+            build_info_end="${EPOCHREALTIME/./}"
+            build_info_ms=$(((build_info_end - build_info_start) / 1000))
         fi
 
         if [[ -z "$build_info" ]]; then
@@ -535,6 +542,7 @@ __buildgit_monitor_build_impl() {
         local building result
         building=$(echo "$build_info" | jq -r '.building')
         result=$(echo "$build_info" | jq -r '.result // empty')
+        monitor_build_info="$build_info"
 
         # Collect deferred-header output first so API calls complete before clear+redraw.
         if [[ "${_DEFERRED_COMMIT:-false}" == "true" || "${_DEFERRED_AGENT:-false}" == "true" || "${_DEFERRED_CONSOLE:-false}" == "true" || "${_DEFERRED_WAITED:-false}" == "true" ]]; then
@@ -739,7 +747,7 @@ __buildgit_monitor_build_impl() {
             done
             if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
                 local total_ms
-                total_ms=$(_buildgit_timing_ms "$iter_start" "$(date +%s)")
+                total_ms=$(( (${EPOCHREALTIME/./} - iter_start_us) / 1000 ))
                 printf '[buildgit-timing] iter=%d build_info=%d stage_track=%d total=%d building=%s\n' \
                     "$iter_num" "$build_info_ms" "$stage_track_ms" "$total_ms" "$building" >&2
             fi
@@ -755,8 +763,9 @@ __buildgit_monitor_build_impl() {
         # Spec: nested-jobs-display-spec.md - track downstream builds in real-time
         local stage_track_start=""
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
-            stage_track_start=$(date +%s)
+            stage_track_start="${EPOCHREALTIME/./}"
         fi
+        monitor_stage_snapshot=$(_get_live_pipeline_snapshot "$job_name" "$build_number") || monitor_stage_snapshot=""
         if [[ "$render_progress" == "true" && -n "$stage_log_file" ]]; then
             BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>"$stage_log_file" >"$stage_state_file"
             stage_state=$(cat "$stage_state_file")
@@ -767,7 +776,7 @@ __buildgit_monitor_build_impl() {
             stage_state=$(cat "$stage_state_file")
         fi
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
-            stage_track_ms=$(_buildgit_timing_ms "$stage_track_start" "$(date +%s)")
+            stage_track_ms=$(( (${EPOCHREALTIME/./} - stage_track_start) / 1000 ))
         fi
 
         # --bail-on-red: stop monitoring as soon as a stage has failed, rather
@@ -876,7 +885,7 @@ __buildgit_monitor_build_impl() {
         _buildgit_iter_cache_end
         if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
             local total_ms
-            total_ms=$(_buildgit_timing_ms "$iter_start" "$(date +%s)")
+            total_ms=$(( (${EPOCHREALTIME/./} - iter_start_us) / 1000 ))
             printf '[buildgit-timing] iter=%d build_info=%d stage_track=%d total=%d building=%s\n' \
                 "$iter_num" "$build_info_ms" "$stage_track_ms" "$total_ms" "$building" >&2
         fi

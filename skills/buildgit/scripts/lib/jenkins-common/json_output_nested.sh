@@ -303,7 +303,7 @@ _map_stages_to_downstream() {
     # Accumulate matches into parallel arrays; emit one jq fork at the end.
     local -a _map_out_stages=() _map_out_jobs=() _map_out_builds=()
     # Track downstream keys already claimed by a positive-score match.
-    local -a _map_claimed_keys=()
+    local -A _map_claimed_keys=()
 
     local i=0
     while [[ $i -lt $stage_count ]]; do
@@ -327,22 +327,11 @@ _map_stages_to_downstream() {
                 ds_build=$(echo "$selected_downstream" | awk '{print $2}')
 
                 if [[ -n "$ds_job" && -n "$ds_build" ]]; then
-                    local downstream_key selected_score already_claimed_by_positive
+                local downstream_key selected_score
                     downstream_key="${ds_job}#${ds_build}"
                     selected_score=$(_downstream_stage_job_match_score "$stage_name" "$ds_job")
 
-                    already_claimed_by_positive="false"
-                    if [[ ${#_map_claimed_keys[@]} -gt 0 ]]; then
-                        local _ck
-                        for _ck in "${_map_claimed_keys[@]}"; do
-                            if [[ "$_ck" == "$downstream_key" ]]; then
-                                already_claimed_by_positive="true"
-                                break
-                            fi
-                        done
-                    fi
-
-                    if [[ "$selected_score" -le 0 && "$already_claimed_by_positive" == "true" ]]; then
+                if [[ "$selected_score" -le 0 && "${_map_claimed_keys[$downstream_key]:-}" == true ]]; then
                         i=$((i + 1))
                         continue
                     fi
@@ -351,7 +340,7 @@ _map_stages_to_downstream() {
                     _map_out_jobs+=("$ds_job")
                     _map_out_builds+=("$ds_build")
                     if [[ "$selected_score" -gt 0 ]]; then
-                        _map_claimed_keys+=("$downstream_key")
+                    _map_claimed_keys["$downstream_key"]=true
                     fi
                 fi
             fi

@@ -4,6 +4,19 @@
 # Global variable set by verify_job_exists
 JOB_URL=""
 
+# A diagnostic can share a deadline across multiple requests. Normal API
+# reads have a per-request timeout, including downloads of progressive logs.
+_jenkins_get() {
+    local timeout="${BUILDGIT_HTTP_TIMEOUT:-30}"
+    if [[ -n "${BUILDGIT_HTTP_DEADLINE:-}" ]]; then
+        local remaining=$((BUILDGIT_HTTP_DEADLINE - EPOCHSECONDS))
+        (( remaining > 0 )) || return 28
+        (( remaining >= timeout )) || timeout="$remaining"
+    fi
+    curl -s -g --connect-timeout 5 --max-time "$timeout" \
+        -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" "$@"
+}
+
 # Make authenticated GET request to Jenkins API
 # Usage: jenkins_api "/job/myjob/api/json"
 # Returns: Response body (or empty string on failure)
@@ -12,7 +25,7 @@ jenkins_api() {
     local endpoint="$1"
     local url="${JENKINS_URL}${endpoint}"
 
-    curl -s -f -g -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" "$url"
+    _jenkins_get -f "$url"
 }
 
 # Make authenticated GET request and return body with HTTP status code
@@ -25,7 +38,11 @@ jenkins_api_with_status() {
     local endpoint="$1"
     local url="${JENKINS_URL}${endpoint}"
 
-    curl -s -g -w "\n%{http_code}" -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" "$url"
+    if ! _jenkins_get -w "\n%{http_code}" "$url"; then
+        # Headers can arrive before a timeout truncates the body.
+        printf '\n000'
+        return 1
+    fi
 }
 
 # Make authenticated GET request saving response headers and body to files.
@@ -41,11 +58,11 @@ jenkins_api_progressive() {
     local url="${JENKINS_URL}${endpoint}"
 
     if [[ -n "$console_annotator" ]]; then
-        curl -s -f -g -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" \
+        _jenkins_get -f \
             -H "X-ConsoleAnnotator: ${console_annotator}" \
             -D "$headers_file" -o "$body_file" "$url"
     else
-        curl -s -f -g -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" \
+        _jenkins_get -f \
             -D "$headers_file" -o "$body_file" "$url"
     fi
 }
@@ -219,7 +236,7 @@ wait_for_queue_item() {
 
     while true; do
         local response
-        response=$(curl -s -f -u "${JENKINS_USER_ID}:${JENKINS_API_TOKEN}" "$queue_api_url" 2>/dev/null) || true
+        response=$(_jenkins_get -f "$queue_api_url" 2>/dev/null) || true
 
         if [[ -n "$response" ]]; then
             queue_confirmed=true
@@ -744,39 +761,32 @@ _find_stage_console_match() {
     esac
 }
 
+# Jenkins's annotated console exposes enclosing block IDs. Blue Ocean's
+# firstParent is a graph predecessor, which can be a sequential sibling.
 _get_stage_console_descendants() {
-    local stages_json="$1"
-    local blue_nodes_json="$2"
-    local root_stage_id="$3"
-
-    if [[ -z "$stages_json" || "$stages_json" == "[]" || -z "$blue_nodes_json" || "$blue_nodes_json" == "[]" || -z "$root_stage_id" ]]; then
-        echo "[]"
+    local job_name="$1" build_number="$2" stages_json="$3" root_stage_id="$4"
+    if ! jq -e 'length > 1' <<< "$stages_json" >/dev/null; then
+        echo '[]'
         return 0
     fi
-
-    echo "$stages_json" | jq -c \
-        --arg root_id "$root_stage_id" \
-        --argjson nodes "$blue_nodes_json" '
-        def node_by_id($id):
-            first($nodes[] | select((.id // "" | tostring) == ($id | tostring)));
-        def is_descendant_of($id):
-            if ($id | tostring) == ($root_id | tostring) then
-                true
-            else
-                (node_by_id($id)) as $node
-                | if ($node == null) then
-                    false
-                  else
-                    ($node.firstParent // "") as $parent
-                    | if $parent == "" then
-                        false
-                      else
-                        is_descendant_of($parent)
-                      end
-                  end
+    local edges
+    edges=$(get_console_html_cached "$job_name" "$build_number" | awk -v RS='>' '
+        /class="pipeline-new-node"/ && /nodeId="[0-9]+"/ && /enclosingId="[0-9]+"/ {
+            match($0, /nodeId="[0-9]+"/)
+            id = substr($0, RSTART + 8, RLENGTH - 9)
+            match($0, /enclosingId="[0-9]+"/)
+            parent = substr($0, RSTART + 13, RLENGTH - 14)
+            print id, parent
+        }
+    ') || edges=""
+    printf '%s\n' "$stages_json" | jq -c --arg root "$root_stage_id" --arg edges "$edges" '
+        ($edges | split("\n") | map(select(length > 0) | split(" ") | {key: .[0], value: .[1]}) | from_entries) as $parents
+        | def enclosed($id; $seen):
+            if $id == $root then true
+            elif $id == null or $seen[$id] then false
+            else enclosed($parents[$id]; $seen + {($id): true})
             end;
-
-        [ .[] | select((.id // "") != "" and is_descendant_of(.id)) ]
+        [ .[] | select(.id != null and (.id | tostring) != $root and enclosed((.id | tostring); {})) ]
     ' 2>/dev/null || echo "[]"
 }
 
@@ -794,10 +804,11 @@ _get_stage_console_log_text() {
         return 1
     fi
 
-    local body_type log_text
-    body_type=$(echo "$body" | jq -r 'type // empty' 2>/dev/null) || true
-    log_text=$(echo "$body" | jq -r 'if type == "object" then (.text // "") else empty end' 2>/dev/null) || true
-    if [[ "$body_type" == "object" ]]; then
+    local log_text
+    if log_text=$(printf '%s' "$body" | jq -er 'select(type == "object") | .text // ""' 2>/dev/null); then
+        if printf '%s' "$body" | jq -e '.hasMore == true' >/dev/null 2>&1; then
+            printf 'buildgit: Jenkins returned a partial log for node %s.\n' "$stage_id" >&2
+        fi
         printf '%s' "$log_text" | perl -0pe 's/<[^>]+>//g; s/&nbsp;/ /g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/\r//g'
     else
         printf '%s' "$body"
@@ -833,48 +844,25 @@ _get_stage_console_flow_nodes() {
 }
 
 _get_stage_console_candidate_nodes() {
-    local job_path="$1"
-    local build_number="$2"
-    local stages_json="$3"
-    local blue_nodes_json="$4"
-    local root_stage_id="$5"
-
-    local result_json descendant_stages_json descendant_count descendant_index
-    result_json=$(_get_stage_console_flow_nodes "$job_path" "$build_number" "$root_stage_id")
-    descendant_stages_json=$(_get_stage_console_descendants "$stages_json" "$blue_nodes_json" "$root_stage_id")
-    descendant_count=$(echo "$descendant_stages_json" | jq 'length' 2>/dev/null || echo 0)
-    descendant_index=0
-
-    while [[ "$descendant_index" -lt "$descendant_count" ]]; do
-        local descendant_json descendant_id descendant_flow_nodes_json
-        descendant_json=$(echo "$descendant_stages_json" | jq -c ".[$descendant_index]" 2>/dev/null)
-        descendant_id=$(echo "$descendant_json" | jq -r '.id // empty' 2>/dev/null)
-        descendant_index=$((descendant_index + 1))
-
-        if [[ -z "$descendant_id" || "$descendant_id" == "$root_stage_id" ]]; then
-            continue
-        fi
-
-        descendant_flow_nodes_json=$(_get_stage_console_flow_nodes "$job_path" "$build_number" "$descendant_id")
-        result_json=$(jq -cs '
-            add
-            | reduce .[] as $node (
-                [];
-                if (($node.id // "") == "") then
-                    .
-                elif any(.[]; (.id // "") == ($node.id // "")) then
-                    .
-                else
-                    . + [$node]
-                end
-            )
-        ' \
-            <(printf '%s\n' "$result_json") \
-            <(printf '%s\n' "[$descendant_json]") \
-            <(printf '%s\n' "$descendant_flow_nodes_json") 2>/dev/null)
-    done
-
-    printf '%s\n' "${result_json:-[]}"
+    local job_name="$1" job_path="$2" build_number="$3" stages_json="$4" root_stage_id="$5"
+    local descendants root_nodes descendant_id descendant_json descendant_nodes
+    root_nodes=$(_get_stage_console_flow_nodes "$job_path" "$build_number" "$root_stage_id")
+    descendants=$(_get_stage_console_descendants "$job_name" "$build_number" "$stages_json" "$root_stage_id")
+    {
+        printf '%s\n' "$root_nodes"
+        while IFS=$'\x1f' read -r descendant_id descendant_json; do
+            [[ -z "$descendant_id" ]] && continue
+            printf '%s\n' "$descendant_json"
+            descendant_nodes=$(_get_stage_console_flow_nodes "$job_path" "$build_number" "$descendant_id")
+            printf '%s\n' "$descendant_nodes"
+        done < <(jq -r '.[] | [.id, tojson] | join("\u001f")' <<< "$descendants")
+    } | jq -cs '
+        [.[] | if type == "array" then .[] else . end]
+        | reduce .[] as $node ({seen: {}, nodes: []};
+            ($node.id // "" | tostring) as $id
+            | if $id == "" or .seen[$id] then . else .seen[$id] = true | .nodes += [$node] end)
+        | .nodes
+    ' 2>/dev/null
 }
 
 get_console_output_raw() {
@@ -898,81 +886,70 @@ get_console_output_raw() {
     return 1
 }
 
+_get_graph_stage_console_log() {
+    local job_path="$1" build_number="$2" node_id="$3" log_text
+    log_text=$(jenkins_api "${job_path}/${build_number}/stages/log?nodeId=${node_id}" 2>/dev/null) || return 1
+    # Graph View returns the placeholder with HTTP 200 when a node lacks a log.
+    [[ "$log_text" != 'No logs found' && "$log_text" == *[!$' \t\r\n']* ]] || return 1
+    printf '%s\n' "$log_text"
+}
+
 get_stage_console_output() {
-    local job_name="$1"
-    local build_number="$2"
-    local requested_stage_name="$3"
+    local job_name="$1" build_number="$2" requested_stage_name="$3"
+    local known_node_id="${4:-}"
     local job_path
     job_path=$(jenkins_job_path "$job_name")
-    if [[ -z "$job_path" ]]; then
-        return 1
+    [[ -n "$job_path" ]] || return 1
+
+    if [[ "$known_node_id" =~ ^[0-9]+$ ]] && _get_graph_stage_console_log "$job_path" "$build_number" "$known_node_id"; then
+        return 0
     fi
 
-    local stages_json blue_nodes_json matched_stage_json matched_stage_id matched_stage_name
+    local stages_json matched_stage_json matched_stage_id matched_stage_name match_rc
     stages_json=$(get_all_stages "$job_name" "$build_number")
-    _STAGE_CONSOLE_AVAILABLE_STAGES=$(echo "$stages_json" | jq -r '.[].name' 2>/dev/null || true)
-    matched_stage_json=$(_find_stage_console_match "$stages_json" "$requested_stage_name") || {
-        local match_rc=$?
-        if [[ "$match_rc" -eq 4 ]]; then
-            return 4
-        fi
-        return 3
-    }
-
-    matched_stage_id=$(echo "$matched_stage_json" | jq -r '.id // empty' 2>/dev/null)
-    matched_stage_name=$(echo "$matched_stage_json" | jq -r '.name // empty' 2>/dev/null)
-    if [[ -z "$matched_stage_id" ]]; then
-        return 3
-    fi
-
-    local direct_log_text
-    if ! direct_log_text=$(_get_stage_console_log_text "$job_path" "$build_number" "$matched_stage_id"); then
-        return 1
-    fi
-
-    if [[ -n "${direct_log_text//[$' \t\r\n']}" ]]; then
-        printf '%s\n' "$direct_log_text"
-        return 0
-    fi
-
-    blue_nodes_json=$(get_blue_ocean_nodes "$job_name" "$build_number" 2>/dev/null) || blue_nodes_json="[]"
-
-    local candidate_nodes_json
-    candidate_nodes_json=$(_get_stage_console_candidate_nodes "$job_path" "$build_number" "$stages_json" "$blue_nodes_json" "$matched_stage_id")
-
-    local candidate_count candidate_index combined_output
-    candidate_count=$(echo "$candidate_nodes_json" | jq 'length' 2>/dev/null || echo 0)
-    if [[ "$candidate_count" -eq 0 ]]; then
-        printf '%s\n' "$direct_log_text"
-        return 0
-    fi
-
-    combined_output=""
-    candidate_index=0
-    while [[ "$candidate_index" -lt "$candidate_count" ]]; do
-        local candidate_id candidate_name candidate_log
-        candidate_id=$(echo "$candidate_nodes_json" | jq -r ".[$candidate_index].id // empty" 2>/dev/null)
-        candidate_name=$(echo "$candidate_nodes_json" | jq -r ".[$candidate_index].name // empty" 2>/dev/null)
-        candidate_index=$((candidate_index + 1))
-        [[ -z "$candidate_id" || "$candidate_id" == "$matched_stage_id" ]] && continue
-        if ! candidate_log=$(_get_stage_console_log_text "$job_path" "$build_number" "$candidate_id"); then
-            return 1
-        fi
-        if [[ -z "${candidate_log//[$' \t\r\n']}" ]]; then
-            continue
-        fi
-        combined_output+=$'\n'"===== ${matched_stage_name} -> ${candidate_name} ====="$'\n'
-        combined_output+="$candidate_log"
-        combined_output+=$'\n'
-    done
-
-    if [[ -n "${combined_output//[$' \t\r\n']}" ]]; then
-        printf '%s' "$combined_output"
+    _STAGE_CONSOLE_AVAILABLE_STAGES=$(jq -r '.[].name' <<< "$stages_json" 2>/dev/null || true)
+    if matched_stage_json=$(_find_stage_console_match "$stages_json" "$requested_stage_name"); then
+        match_rc=0
     else
+        match_rc=$?
+        local graph graph_stages
+        if [[ "$match_rc" -ne 4 ]] && graph=$(jenkins_api "${job_path}/${build_number}/stages/tree" 2>/dev/null) \
+            && graph_stages=$(_normalize_pipeline_graph <<< "$graph" | jq -c '.nested') \
+            && matched_stage_json=$(_find_stage_console_match "$graph_stages" "$requested_stage_name"); then
+            match_rc=0
+        fi
+        if [[ "$match_rc" -eq 4 ]]; then return 4; fi
+        [[ "$match_rc" -eq 0 ]] || return 3
+    fi
+    IFS=$'\x1f' read -r matched_stage_id matched_stage_name < <(
+        jq -r '[.id, .name] | join("\u001f")' <<< "$matched_stage_json"
+    )
+    [[ -n "$matched_stage_id" ]] || return 3
+
+    if _get_graph_stage_console_log "$job_path" "$build_number" "$matched_stage_id"; then
+        return 0
+    fi
+    local direct_log_text
+    direct_log_text=$(_get_stage_console_log_text "$job_path" "$build_number" "$matched_stage_id") || return 1
+    if [[ "$direct_log_text" == *[!$' \t\r\n']* ]]; then
+        printf '%s\n' "$direct_log_text"
+        return 0
+    fi
+
+    local candidate_nodes candidate_id candidate_name candidate_log printed=false
+    candidate_nodes=$(_get_stage_console_candidate_nodes "$job_name" "$job_path" "$build_number" "$stages_json" "$matched_stage_id") || return 1
+    while IFS=$'\x1f' read -r candidate_id candidate_name; do
+        [[ -z "$candidate_id" || "$candidate_id" == "$matched_stage_id" ]] && continue
+        candidate_log=$(_get_stage_console_log_text "$job_path" "$build_number" "$candidate_id") || return 1
+        [[ "$candidate_log" == *[!$' \t\r\n']* ]] || continue
+        printf '\n===== %s -> %s =====\n%s\n' "$matched_stage_name" "$candidate_name" "$candidate_log"
+        printed=true
+    done < <(jq -r '.[] | [.id, .name] | join("\u001f")' <<< "$candidate_nodes")
+    if [[ "$printed" == false ]]; then
         printf '%s\n' "$direct_log_text"
     fi
-    return 0
 }
+
 
 # Resolve a stage path ("A->B->C") to the job and build that run it.
 # Usage: resolve_stage_path_target "job" "build#" "path" ["stage_entries_json"]
@@ -1004,7 +981,7 @@ resolve_stage_path_target() {
     if [[ -z "$entries_json" ]]; then
         entries_json=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || entries_json="[]"
     fi
-    [[ -z "${entries_json//[$' \t\r\n']}" ]] && entries_json="[]"
+    [[ "$entries_json" == *[!$' \t\r\n']* ]] || entries_json="[]"
 
     local target
     target=$(printf '%s\n' "$entries_json" | jq -r --arg path "$stage_path" '
@@ -1065,15 +1042,8 @@ get_current_stage() {
 get_all_stages() {
     local job_name="$1"
     local build_number="$2"
-    local job_path
-    job_path=$(jenkins_job_path "$job_name")
-    if [[ -z "$job_path" ]]; then
-        echo "[]"
-        return 0
-    fi
-
     local response
-    response=$(jenkins_api "${job_path}/${build_number}/wfapi/describe" 2>/dev/null) || true
+    response=$(get_workflow_description "$job_name" "$build_number") || true
 
     if [[ -z "$response" ]]; then
         echo "[]"
@@ -1100,6 +1070,27 @@ get_all_stages() {
     fi
 
     echo "$stages_json"
+}
+
+get_workflow_description() {
+    local job_name="$1" build_number="$2" job_path response cache_file=""
+    if [[ -n "${BUILDGIT_ITER_CACHE_DIR:-}" ]]; then
+        local job_key="${job_name//%/%25}"
+        cache_file="${BUILDGIT_ITER_CACHE_DIR}/wf_${job_key//\//%2F}_${build_number}"
+        if [[ -f "$cache_file" ]]; then
+            cat "$cache_file"
+            return
+        fi
+    fi
+    job_path=$(jenkins_job_path "$job_name")
+    [[ -n "$job_path" ]] || return 1
+    response=$(jenkins_api "${job_path}/${build_number}/wfapi/describe" 2>/dev/null) || return 1
+    if [[ -n "$cache_file" ]]; then
+        local temporary="${cache_file}.${BASHPID}"
+        printf '%s' "$response" > "$temporary"
+        mv -f "$temporary" "$cache_file"
+    fi
+    printf '%s\n' "$response"
 }
 
 get_blue_ocean_nodes() {

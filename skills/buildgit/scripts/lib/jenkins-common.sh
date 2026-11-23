@@ -331,6 +331,7 @@ BUILDGIT_SKILL_LIB_DIR="$(_resolve_buildgit_realpath "${BASH_SOURCE[0]}")"
 
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/job_discovery.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/api_test_results.sh"
+source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/pipeline_graph.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/stage_test_correlation.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/failure_analysis.sh"
 source "${BUILDGIT_SKILL_LIB_DIR}/jenkins-common/stage_display.sh"

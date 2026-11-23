@@ -65,6 +65,20 @@ _infer_push_branch_from_args() {
     _get_current_git_branch || return 1
 }
 
+_resolve_multibranch_branch() {
+    local job_name="$1" branch="$2" command_mode="$3"
+    if multibranch_branch_exists "$job_name" "$branch"; then
+        printf '%s/%s\n' "$job_name" "$branch"
+        return 0
+    fi
+    if [[ "$command_mode" == push ]]; then
+        printf '%s/%s\n' "$job_name" "$branch"
+        return 4  # Push succeeded. Jenkins may still be indexing the branch.
+    fi
+    bg_log_error "Branch '${branch}' not found in multibranch job '${job_name}'. Push the branch and wait for Jenkins to scan."
+    return 1
+}
+
 _resolve_effective_job_name() {
     local requested_job_name="$1"
     local command_mode="${2:-status}"
@@ -99,12 +113,8 @@ _resolve_effective_job_name() {
             bg_log_error "Jenkins job '${requested_job_name}' not found"
             return 1
         fi
-        if ! multibranch_branch_exists "$top_job_name" "$explicit_branch_name"; then
-            bg_log_error "Branch '${explicit_branch_name}' not found in multibranch job '${top_job_name}'. Push the branch and wait for Jenkins to scan."
-            return 1
-        fi
-        echo "${top_job_name}/${explicit_branch_name}"
-        return 0
+        _resolve_multibranch_branch "$top_job_name" "$explicit_branch_name" "$command_mode"
+        return $?
     fi
 
     if [[ "$job_type" == "multibranch" ]]; then
@@ -130,20 +140,33 @@ _resolve_effective_job_name() {
             bg_log_error "Could not determine git branch for multibranch job '${top_job_name}'"
             return 1
         fi
-        if ! multibranch_branch_exists "$top_job_name" "$inferred_branch"; then
-            bg_log_error "Branch '${inferred_branch}' not found in multibranch job '${top_job_name}'. Push the branch and wait for Jenkins to scan."
-            return 1
-        fi
-        echo "${top_job_name}/${inferred_branch}"
-        return 0
+        _resolve_multibranch_branch "$top_job_name" "$inferred_branch" "$command_mode"
+        return $?
     fi
 
     echo "$top_job_name"
 }
 
+_wait_for_indexed_branch() {
+    local job_name="$1"
+    local job="${job_name%%/*}" branch="${job_name#*/}"
+    local deadline=$((EPOCHSECONDS + ${BUILD_START_TIMEOUT:-120}))
+    local BUILDGIT_HTTP_DEADLINE="$deadline"
+    bg_log_progress "Waiting for Jenkins to index '$job_name'..."
+    until multibranch_branch_exists "$job" "$branch"; do
+        local remaining=$((deadline - EPOCHSECONDS))
+        if (( remaining <= 0 )); then
+            bg_log_error "Timed out waiting for Jenkins to index '$job_name'"
+            return 1
+        fi
+        sleep "$((remaining < POLL_INTERVAL ? remaining : POLL_INTERVAL))"
+    done
+}
+
 _validate_jenkins_setup() {
     local context="$1"  # e.g., "monitor Jenkins builds", "trigger Jenkins build"
     local command_mode="${2:-status}"
+    _VALIDATED_JOB_WAS_MISSING=false
 
     if ! validate_dependencies; then
         bg_log_error "Cannot ${context} - missing dependencies (jq, curl)"
@@ -177,7 +200,12 @@ _validate_jenkins_setup() {
         return 1
     fi
 
-    if ! _VALIDATED_JOB_NAME=$(_resolve_effective_job_name "$_VALIDATED_JOB_NAME" "$command_mode"); then
+    local resolve_status=0
+    _VALIDATED_JOB_NAME=$(_resolve_effective_job_name "$_VALIDATED_JOB_NAME" "$command_mode") || resolve_status=$?
+    if [[ "$resolve_status" -eq 4 && "$command_mode" == push ]]; then
+        _VALIDATED_JOB_WAS_MISSING=true
+        _wait_for_indexed_branch "$_VALIDATED_JOB_NAME" || return 1
+    elif [[ "$resolve_status" -ne 0 ]]; then
         bg_log_error "Cannot ${context} - could not resolve Jenkins job"
         bg_log_essential "Suggestion: Verify --job value and git branch"
         return 1
