@@ -207,11 +207,12 @@ The full stage path also works with `--console-text` on the root job: `buildgit 
 
 ## Wait for a build to finish (`wait`)
 
-`wait` blocks until one build stops running and prints its `--line` row. It never bails on a failed stage and never waits for a new build, so it is the command to run in the background after a bail, before pushing a fix. The start line goes to stderr; the row (or `--json` object) goes to stdout.
+`wait` blocks until one build stops running and prints its `--line` row. It never bails on a failed stage and never waits for a new build, so it is the command to run in the background after a bail, before pushing a fix. The start line and the verdict for a live wait that fetches report details go to stderr. The row or `--json` object goes to stdout.
 
 ```text
 $ buildgit wait --queue
 [07:27:03] ℹ Waiting for phandlemono/PH0345-owner-supersession #5 to finish (running 9m 12s)...
+Jenkins result for phandlemono/PH0345-owner-supersession #5: FAILURE
 FAILURE     #5 id=b188802 Tests=1180/12/4 Took 23m 0s on 2026-11-11T07:32:38-0700 (5 seconds ago)
 $ echo $?
 1
@@ -572,6 +573,8 @@ Finished: SUCCESS
 ```
 
 ## Full status — build in progress (-f)
+
+Full follow output prints `Jenkins result for JOB #N: RESULT` when Jenkins reports completion. Any remaining stages and test results follow before the `Finished:` footer. Full `push` and `build` use the same output.
 
 ```bash
 $ buildgit status -f

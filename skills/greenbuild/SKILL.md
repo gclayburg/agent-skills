@@ -41,6 +41,7 @@ Run the full workflow for a bare `/greenbuild` invocation. Do not stop merely be
    - A build of this branch still running after a bail-on-red exit counts as busy. Bail-on-red stops monitoring, not the build. Do not relax this gate to get a fix in sooner, and do not cancel the doomed build.
 
 6. **Push and monitor** — if commits need to be pushed, run `buildgit push`. It runs `git push` (to the branch's upstream) and follows the resulting build in one command. Do not chain `status -f` after it.
+   - When present, `Jenkins result for …` is the server's final verdict for that build. Read the rest of the output for stage and test details and use the exit code to advance the workflow. A result from `wait --queue` can appear before the queue clears.
    - If the branch has no upstream yet (`git rev-parse --abbrev-ref @{u}` fails), push it once with `buildgit push -u origin HEAD`.
    - Monitoring stops the moment a stage fails (bail-on-red, exit 3) instead of waiting for the rest of the pipeline. Start diagnosing immediately; do not wait for the build to finish and do not cancel it.
    - **On exit 3, start `buildgit wait --queue` as a background command at once**, before diagnosing. Diagnose and fix while it runs. When both the fix is committed and the wait has returned, push right away. Never wait serially after the fix.

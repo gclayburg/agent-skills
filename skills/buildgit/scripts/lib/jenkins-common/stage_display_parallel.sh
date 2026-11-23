@@ -655,8 +655,13 @@ _force_flush_completion_stages() {
     fi
 
     local current_parent_stages current_nested
-    current_parent_stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || current_parent_stages="[]"
-    current_nested=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || current_nested="[]"
+    if [[ -n "${monitor_stage_snapshot:-}" ]]; then
+        current_parent_stages=$(jq -c '.parent' <<< "$monitor_stage_snapshot")
+        current_nested=$(jq -c '.nested' <<< "$monitor_stage_snapshot")
+    else
+        current_parent_stages=$(get_all_stages "$job_name" "$build_number" 2>/dev/null) || current_parent_stages="[]"
+        current_nested=$(_get_nested_stages "$job_name" "$build_number" 2>/dev/null) || current_nested="[]"
+    fi
     [[ -z "$current_parent_stages" || "$current_parent_stages" == "null" ]] && current_parent_stages="[]"
     [[ -z "$current_nested" || "$current_nested" == "null" ]] && current_nested="[]"
 

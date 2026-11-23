@@ -112,6 +112,15 @@ _wait_for_build_to_stop() {
             _WAIT_BUILD_JSON="$build_json"
             building=$(printf '%s\n' "$build_json" | jq -r '.building // false' 2>/dev/null) || building="true"
             if [[ "$building" != "true" ]]; then
+                # Keep stdout reserved for the requested row or JSON report.
+                # A live wait can expose the verdict while that report is built.
+                if [[ "$announced" == "true" && ( "$WAIT_JSON" == "true" || "$WAIT_NO_TESTS" != "true" ) ]]; then
+                    local result
+                    result=$(jq -r '.result // empty' <<< "$build_json") || result=""
+                    if [[ -n "$result" ]]; then
+                        bg_log_essential "Jenkins result for ${job_name} #${build_number}: ${result}" >&2
+                    fi
+                fi
                 return 0
             fi
             if [[ "$announced" != "true" ]]; then

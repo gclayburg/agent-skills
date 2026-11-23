@@ -424,6 +424,29 @@ _monitor_build_finished_mid_iteration() {
     [[ "$(echo "$info" | jq -r 'if .building == false and (.result // "") != "" then "done" else "" end' 2>/dev/null)" == "done" ]]
 }
 
+# Graph View signals that the root and its downstream runs are complete.
+# Read the detailed stage model once, retaining its console-derived agent
+# attributions and alternate stage paths, then share it with the final flush.
+_get_completed_stage_snapshot() {
+    local job_name="$1" build_number="$2" graph parent nested
+    graph=$(_get_live_pipeline_snapshot "$job_name" "$build_number") || return 1
+    jq -e '.complete == true and (.nested | length > 0)
+        and all(.nested[]; .status != "IN_PROGRESS")' <<< "$graph" >/dev/null || return 1
+
+    parent=$(get_all_stages "$job_name" "$build_number") || return 1
+    nested=$(_get_nested_stages "$job_name" "$build_number") || return 1
+    printf '%s\n' "$parent" "$nested" "$graph" | jq -ces '
+        select(length == 3 and all(.[0:2][]; type == "array" and length > 0))
+        | .[0] as $parent | .[1] as $nested
+        | ($parent + $nested) as $details
+        | select(all($details[]; .status != "IN_PROGRESS"))
+        | ($details | map([.name, .status] | @json) | INDEX(.)) as $known
+        | select(all(.[2].nested[] | select(.status != "NOT_EXECUTED");
+            ([.name, .status] | @json) as $stage | $known | has($stage)))
+        | {parent: $parent, nested: $nested}
+    '
+}
+
 # Unified build monitoring loop
 # Polls Jenkins API until build completes, tracking stage changes in real-time
 # Arguments: job_name, build_number
@@ -544,6 +567,15 @@ __buildgit_monitor_build_impl() {
         result=$(echo "$build_info" | jq -r '.result // empty')
         monitor_build_info="$build_info"
 
+        # Report Jenkins's verdict before any deferred header or final detail fetch.
+        if [[ "$building" == "false" && -n "$result" ]]; then
+            if [[ "$showed_progress" == "true" ]]; then
+                _clear_follow_line_progress_final
+                showed_progress=false
+            fi
+            bg_log_essential "Jenkins result for ${job_name} #${build_number}: ${result}"
+        fi
+
         # Collect deferred-header output first so API calls complete before clear+redraw.
         if [[ "${_DEFERRED_COMMIT:-false}" == "true" || "${_DEFERRED_AGENT:-false}" == "true" || "${_DEFERRED_CONSOLE:-false}" == "true" || "${_DEFERRED_WAITED:-false}" == "true" ]]; then
             if [[ "$render_progress" == "true" && -n "$deferred_log_file" ]]; then
@@ -560,10 +592,6 @@ __buildgit_monitor_build_impl() {
         # settle/flush passes below instead of the top-of-loop tracker.
         # Spec: monitor-poll-latency-spec.md § 3
         if [[ "$building" == "false" && -n "$result" ]]; then
-            if [[ "$showed_progress" == "true" ]]; then
-                _clear_follow_line_progress_final
-                showed_progress=false
-            fi
             _buildgit_iter_cache_end
             if [[ -n "$deferred_output" ]]; then
                 printf '%s\n' "$deferred_output"
@@ -573,6 +601,27 @@ __buildgit_monitor_build_impl() {
                 printf '%s\n' "$stage_output"
                 stage_output=""
             fi
+
+            _buildgit_iter_cache_begin
+            monitor_stage_snapshot=$(_get_completed_stage_snapshot "$job_name" "$build_number") || monitor_stage_snapshot=""
+            _buildgit_iter_cache_end
+            if [[ -n "$monitor_stage_snapshot" ]]; then
+                BUILDGIT_SIDE_EFFECT_FD=3 _track_nested_stage_changes "$job_name" "$build_number" "$stage_state" "$VERBOSE_MODE" 3>&1 >"$stage_state_file"
+                stage_state=$(<"$stage_state_file")
+                if ! jq -e '.tracking_complete' <<< "$stage_state" >/dev/null; then
+                    BUILDGIT_SIDE_EFFECT_FD=3 _force_flush_completion_stages "$job_name" "$build_number" "$stage_state" 3>&1 >"$stage_state_file"
+                    stage_state=$(<"$stage_state_file")
+                fi
+                if jq -e '.tracking_complete' <<< "$stage_state" >/dev/null; then
+                    if [[ -n "${BUILDGIT_DEBUG_TIMING:-}" ]]; then
+                        printf '[buildgit-completion] graph=complete elapsed_ms=%d\n' "$(( (${EPOCHREALTIME/./} - iter_start_us) / 1000 ))" >&2
+                    fi
+                    rm -f "$stage_log_file" "$stage_state_file" "$deferred_log_file" 2>/dev/null || true
+                    return 0
+                fi
+            fi
+            monitor_stage_snapshot=""
+
             # Reconcile late-arriving nested stage metadata before exiting monitor.
             # Jenkins can mark the root build complete slightly before nested
             # stage details are fully available through API/log parsing.
