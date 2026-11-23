@@ -209,7 +209,7 @@ display_success_output() {
     if [[ -z "$test_results_console_output" ]]; then
         test_results_console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null || true)
     fi
-    if collected_results=$(collect_downstream_test_results "$job_name" "$build_number" "$test_results_console_output"); then
+    if collected_results=$(collect_downstream_test_results "$job_name" "$build_number" "$test_results_console_output" counts-if-passing); then
         collected_rc=0
     else
         collected_rc=$?

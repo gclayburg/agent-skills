@@ -567,50 +567,21 @@ _get_nested_stages_uncached() {
     console_output=$(cat "${pfetch_dir}/console" 2>/dev/null)
     local blue_nodes_json
     blue_nodes_json=$(cat "${pfetch_dir}/blue" 2>/dev/null)
-    rm -rf "$pfetch_dir"
 
     [[ -z "$stages_json" || "$stages_json" == "null" ]] && stages_json="[]"
     [[ -z "$blue_nodes_json" || "$blue_nodes_json" == "null" ]] && blue_nodes_json="[]"
     if [[ -z "$stages_json" || "$stages_json" == "[]" ]]; then
+        rm -rf "$pfetch_dir"
         echo "[]"
         return 0
     fi
 
-    local stage_agent_map="{}"
-    local pipeline_scope_agent=""
-    local stage_agent_map_is_html="false"
-    local html_map_attempted="false"
-    if [[ -n "$console_output" ]]; then
-        if _console_has_parallel_block "$console_output"; then
-            local html_stage_agent_map
-            html_stage_agent_map=$(_build_stage_agent_map_from_html "$job_name" "$build_number") || html_stage_agent_map="{}"
-            html_map_attempted="true"
-            if [[ -n "$html_stage_agent_map" && "$html_stage_agent_map" != "{}" ]]; then
-                stage_agent_map="$html_stage_agent_map"
-                stage_agent_map_is_html="true"
-            fi
-        fi
-        if [[ "$stage_agent_map_is_html" != "true" ]]; then
-            stage_agent_map=$(_build_stage_agent_map "$console_output")
-        fi
-        pipeline_scope_agent=$(_extract_pre_stage_agent_from_console "$console_output")
-        if [[ "$stage_agent_map_is_html" != "true" && "$html_map_attempted" != "true" && -z "$pipeline_scope_agent" ]]; then
-            # Serial pipeline with `agent none` + a stage-scoped agent: nested
-            # stages{} under the agent-owning stage have no "Running on" lines
-            # and no pipeline-scope fallback, so the plain-text map leaves them
-            # agent-less. The annotated HTML console's enclosure chains can
-            # attribute them to the nearest enclosing node allocation.
-            local has_agentless_stage
-            has_agentless_stage=$(echo "$stages_json" | jq -r --argjson map "$stage_agent_map" \
-                '[.[]? | .name // empty | select(. != "") | select(($map[.] // "") == "")] | length > 0' 2>/dev/null) || has_agentless_stage="false"
-            if [[ "$has_agentless_stage" == "true" ]]; then
-                local html_fill_map
-                html_fill_map=$(_build_stage_agent_map_from_html "$job_name" "$build_number") || html_fill_map="{}"
-                if [[ -n "$html_fill_map" && "$html_fill_map" != "{}" ]]; then
-                    stage_agent_map=$(jq -cn --argjson text "$stage_agent_map" --argjson html "$html_fill_map" '$text + $html' 2>/dev/null) || stage_agent_map="$html_fill_map"
-                fi
-            fi
-        fi
+    # The annotated HTML gives exact agent attribution but can be expensive.
+    # Fetch and parse it while resolving branch structure and downstream jobs.
+    local html_agent_map_pid=""
+    if [[ -n "$console_output" ]] && _console_has_parallel_block "$console_output"; then
+        _build_stage_agent_map_from_html "$job_name" "$build_number" > "${pfetch_dir}/agents" 3>&- &
+        html_agent_map_pid=$!
     fi
 
     local parallel_info="{}"
@@ -902,6 +873,35 @@ _get_nested_stages_uncached() {
             batch_start=$batch_end
         done
     fi
+
+    local stage_agent_map="{}" pipeline_scope_agent=""
+    local stage_agent_map_is_html=false
+    if [[ -n "$console_output" ]]; then
+        if [[ -n "$html_agent_map_pid" ]] && wait "$html_agent_map_pid"; then
+            stage_agent_map=$(<"${pfetch_dir}/agents")
+        fi
+        if [[ -z "$stage_agent_map" || "$stage_agent_map" == "{}" ]]; then
+            stage_agent_map=$(_build_stage_agent_map "$console_output")
+        else
+            stage_agent_map_is_html=true
+        fi
+        pipeline_scope_agent=$(_extract_pre_stage_agent_from_console "$console_output")
+        if [[ -z "$html_agent_map_pid" && -z "$pipeline_scope_agent" ]]; then
+            # A stage inside a serial agent-owning stage can inherit its
+            # agent from the HTML enclosure even without a Running on line.
+            local has_agentless_stage
+            has_agentless_stage=$(echo "$stages_json" | jq -r --argjson map "$stage_agent_map" \
+                '[.[]? | .name // empty | select(. != "") | select(($map[.] // "") == "")] | length > 0' 2>/dev/null) || has_agentless_stage="false"
+            if [[ "$has_agentless_stage" == "true" ]]; then
+                local html_fill_map
+                html_fill_map=$(_build_stage_agent_map_from_html "$job_name" "$build_number") || html_fill_map="{}"
+                if [[ -n "$html_fill_map" && "$html_fill_map" != "{}" ]]; then
+                    stage_agent_map=$(jq -cn --argjson text "$stage_agent_map" --argjson html "$html_fill_map" '$text + $html' 2>/dev/null) || stage_agent_map="$html_fill_map"
+                fi
+            fi
+        fi
+    fi
+    rm -rf "$pfetch_dir"
 
     local result="[]"
     local deferred_wrappers="{}"

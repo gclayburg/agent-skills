@@ -23,7 +23,7 @@ _handle_build_completion() {
         console_output=$(get_console_output "$job_name" "$build_number" 2>/dev/null) || true
 
         local collected_results collected_rc=0
-        if collected_results=$(collect_downstream_test_results "$job_name" "$build_number" "$console_output"); then
+        if collected_results=$(collect_downstream_test_results "$job_name" "$build_number" "$console_output" counts-if-passing); then
             collected_rc=0
         else
             collected_rc=$?

@@ -33,15 +33,30 @@ display_test_results_comm_error() {
 }
 
 # Fetch test results from Jenkins test report API
-# Usage: fetch_test_results "job-name" "build-number" ["counts"]
+# Usage: fetch_test_results "job-name" "build-number" ["counts"|"counts-if-passing"]
 #        "counts" fetches only passCount/failCount/skipCount: a few bytes
 #        instead of every test case, which runs to megabytes on large suites.
+#        "counts-if-passing" preserves the full report for failures and
+#        checks the full endpoint when the counts response is inconclusive.
 # Returns: JSON test report on success, empty string if not available
 # Spec: test-failure-display-spec.md, Section: Test Report Detection (1.1-1.2)
 fetch_test_results() {
     local job_name="$1"
     local build_number="$2"
     local mode="${3:-}"
+    if [[ "$mode" == "counts-if-passing" ]]; then
+        local counts
+        if counts=$(fetch_test_results "$job_name" "$build_number" counts) && [[ -n "$counts" ]] && jq -es '
+            length == 1 and (.[0] |
+                .failCount == 0
+                and ([.passCount, .skipCount] | all(type == "number" and . >= 0 and . == floor)))
+        ' <<< "$counts" >/dev/null 2>&1; then
+            printf '%s\n' "$counts"
+            return 0
+        fi
+        # This also rechecks a report that was absent at the first request
+        # instead of carrying an empty counts response into the final table.
+    fi
     local job_path
     job_path=$(jenkins_job_path "$job_name")
     if [[ -z "$job_path" ]]; then
@@ -283,9 +298,10 @@ _collect_downstream_test_results_recursive() {
     local depth="$4"
     local stage_label="$5"
     local is_root="${6:-false}"
+    local report_mode="${7:-}"
 
     local test_json="" fetch_rc=0
-    if test_json=$(fetch_test_results "$job_name" "$build_number"); then
+    if test_json=$(fetch_test_results "$job_name" "$build_number" "$report_mode"); then
         fetch_rc=0
     else
         fetch_rc=$?
@@ -333,7 +349,8 @@ _collect_downstream_test_results_recursive() {
             "$downstream_console" \
             "$((depth + 1))" \
             "$downstream_stage" \
-            "false")
+            "false" \
+            "$report_mode")
 
         collected_json=$(_jq_merge_json_arrays "$collected_json" "$child_json")
     done <<< "$downstream_lines"
@@ -342,7 +359,7 @@ _collect_downstream_test_results_recursive() {
 }
 
 # Collect test results for a build and any downstream builds detected from console output.
-# Usage: collect_downstream_test_results "job-name" "build-number" "console-output"
+# Usage: collect_downstream_test_results "job-name" "build-number" "console-output" ["counts-if-passing"]
 # Returns: JSON array of per-job test result objects on stdout.
 #          Each object has: job, stage, build_number, depth, test_json
 #          The first array element is always the parent build.
@@ -351,8 +368,9 @@ collect_downstream_test_results() {
     local job_name="$1"
     local build_number="$2"
     local console_output="$3"
+    local report_mode="${4:-}"
 
-    _collect_downstream_test_results_recursive "$job_name" "$build_number" "$console_output" 0 "$job_name" "true"
+    _collect_downstream_test_results_recursive "$job_name" "$build_number" "$console_output" 0 "$job_name" "true" "$report_mode"
 }
 
 # Emit "passed failed skipped" for a build and, recursively, for every
